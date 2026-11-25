@@ -1,0 +1,4 @@
+<resources>
+    <string name="module_name">微信输入法凝光</string>
+    <string name="module_description">为微信输入法 4.0.1（59201）提供 COUI 凝光键面和实时背景模糊</string>
+</resources>

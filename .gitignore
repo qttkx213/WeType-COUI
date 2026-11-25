@@ -1,0 +1,25 @@
+# IDE and local build outputs
+.idea/
+.gradle/
+.kotlin/
+**/build/
+local.properties
+
+# Local diagnostics and test materials
+.work/
+captures/
+*.log
+*.dex
+
+# Android packages and signing material
+*.apk
+*.apks
+*.aab
+*.idsig
+*.jks
+*.keystore
+*.p12
+
+# Local environment overrides
+.env
+.env.*

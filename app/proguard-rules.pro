@@ -1,0 +1,2 @@
+-keep class local.wetype.couiglass.WeTypeModule { public *; }
+-dontwarn io.github.libxposed.annotation.**
