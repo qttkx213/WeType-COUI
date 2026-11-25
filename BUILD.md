@@ -21,7 +21,7 @@ macOS 或 Linux 使用仓库自带的 Gradle Wrapper。
 sh ./gradlew :app:testDebugUnitTest :app:assembleDebug
 ```
 
-Windows 也可用 `build.ps1`。该脚本默认使用仓库旁边的 `AndroidBuild` 目录，里面放 `android-sdk` 和 `jdk/jdk-21*`。工具另有位置时使用 `-ToolsRoot` 指定。
+Windows 也可在 PowerShell 7 中运行 `build.ps1`。该脚本默认使用仓库旁边的 `AndroidBuild` 目录，里面放 `android-sdk` 和 `jdk/jdk-21*`。工具另有位置时使用 `-ToolsRoot` 指定。
 
 ```powershell
 ./build.ps1 -ToolsRoot 'D:\AndroidBuild'
@@ -29,7 +29,7 @@ Windows 也可用 `build.ps1`。该脚本默认使用仓库旁边的 `AndroidBui
 
 输出文件为 `app/build/outputs/apk/debug/app-debug.apk`。Gradle 使用本机构建环境的调试证书签名。覆盖安装已有模块时，需要用相同的证书签名。
 
-本仓库发布源码。当前构建产物会打包 COUI-Kit 所含的部分上游资源，资源适用各自权利声明。 [资源来源](https://github.com/ItosEO/COUI-Kit/blob/v0.0.1-alpha12/coui/RESOURCE_SOURCES.md)
+模块打包时会收缩未使用的资源。发版时检查 APK 里的资源、LSPosed 入口和许可文本。上游资源适用各自的权利声明。 [资源来源](https://github.com/ItosEO/COUI-Kit/blob/v0.0.1-alpha12/coui/RESOURCE_SOURCES.md)
 
 ## 代码入口
 
