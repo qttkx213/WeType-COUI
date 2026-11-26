@@ -6,9 +6,10 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 public final class AppearanceTest {
-    @Test public void usesTheReferencePanelColorsWhenBlurIsUnavailable() {
-        assertEquals(0xFFDDDDDF, CouiPalette.panel(false, false));
-        assertEquals(0xFF0F1014, CouiPalette.panel(true, false));
+    @Test public void usesNeutralPanelColorsWhenBlurIsUnavailable() {
+        assertEquals(0xFFD4D7DD, CouiPalette.panel(false, false));
+        assertEquals(0xFF1C1C1E, CouiPalette.panel(true, false));
+        assertEquals(0xA81C1C1E, CouiPalette.panel(true, true));
         for (boolean dark : new boolean[]{true, false}) {
             assertTrue(alpha(CouiPalette.panel(dark, true)) < alpha(CouiPalette.panel(dark, false)));
         }

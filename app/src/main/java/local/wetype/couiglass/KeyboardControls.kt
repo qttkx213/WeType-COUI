@@ -38,6 +38,7 @@ internal object KeyboardControls {
     private const val SYMBOL_STRIP_KEY = "S4_recycleview"
     private const val NUMERIC_RETRY_DELAY_MS = 250L
     private var host: HostControls? = null
+    private var rebindSymbolCells: ((ViewGroup) -> Unit)? = null
     private var nativeNumeric: NativeNumeric? = null
     private var numericTray: NumericTray? = null
     private var failedStock: WeakReference<ViewGroup>? = null
@@ -50,17 +51,19 @@ internal object KeyboardControls {
         module.intercept(DrawHooks.method(ViewGroup::class.java, "dispatchTouchEvent", Boolean::class.javaPrimitiveType,
             MotionEvent::class.java)) { chain ->
             val group = chain.thisObject as ViewGroup
-            val categories = group.background as? EmojiCategories
-            if (categories != null) {
-                categories.dispatch(chain, chain.getArg(0) as MotionEvent)
-            } else {
-                chain.proceed()
+            when (val background = group.background) {
+                is EmojiCategories -> background.dispatch(chain, chain.getArg(0) as MotionEvent)
+                is SymbolCategories -> background.dispatch(group, chain, chain.getArg(0) as MotionEvent)
+                else -> chain.proceed()
             }
         }
         module.intercept(DrawHooks.method(controls.recycler, "draw", Void.TYPE, Canvas::class.java)) { chain ->
             val group = chain.thisObject as ViewGroup
-            val categories = group.background as? EmojiCategories
-            if (categories == null) chain.proceed() else categories.drawGroup(group, chain)
+            when (val background = group.background) {
+                is EmojiCategories -> background.drawGroup(group, chain)
+                is SymbolCategories -> background.drawGroup(group, chain)
+                else -> chain.proceed()
+            }
         }
         module.intercept(DrawHooks.method(controls.recycler, "dispatchChildAttached", Void.TYPE, View::class.java)) { chain ->
             val result = chain.proceed()
@@ -92,6 +95,13 @@ internal object KeyboardControls {
             }
         }
         host = controls
+        try {
+            rebindSymbolCells = SymbolCategories.install(module, loader, controls.recycler)
+        } catch (error: Exception) {
+            module.warn("Using original symbol categories", error)
+        } catch (error: LinkageError) {
+            module.warn("Using original symbol categories", error)
+        }
         try {
             val native = NativeNumeric(module, loader, controls)
             val buttonDrawer = Class.forName(HOST + "keyboard.selfdraw.e", false, loader)
@@ -202,9 +212,12 @@ internal object KeyboardControls {
     @JvmStatic
     fun background(style: KeyboardStyle, view: View, original: Drawable?): Drawable? {
         val controls = host ?: return null
+        val rebind = rebindSymbolCells
         return when {
             view is ViewGroup && view.id == EMOJI_BAR && view.parentView()?.javaClass?.name == EMOJI_KEYBOARD ->
                 original as? EmojiCategories ?: EmojiCategories(style, view, original, controls)
+            view is ViewGroup && rebind != null && SymbolCategories.matches(view) ->
+                original as? SymbolCategories ?: SymbolCategories(style, view, original, controls.childPosition, rebind)
             rowControl(view) != null -> original as? StockRowBackground ?: StockRowBackground(view, original)
             else -> null
         }
@@ -219,6 +232,16 @@ internal object KeyboardControls {
             categories.actionFace(keyboard, id == "return")
         } catch (_: ReflectiveOperationException) {
             null
+        }
+    }
+
+    internal fun cancelNativeTouch(chain: XposedInterface.Chain, event: MotionEvent) {
+        val cancel = MotionEvent.obtain(event)
+        try {
+            cancel.action = MotionEvent.ACTION_CANCEL
+            chain.proceed(arrayOf(cancel))
+        } finally {
+            cancel.recycle()
         }
     }
 
@@ -257,7 +280,7 @@ internal object KeyboardControls {
             bounds.bottom - if (shifted.invoke(owner) == true) shadow.invoke(button) as Float else 0f
     }
 
-    private abstract class ControlBackground(protected val stock: Drawable?) : Drawable() {
+    internal abstract class ControlBackground(protected val stock: Drawable?) : Drawable() {
         protected var drawableAlpha = 255
         override fun setAlpha(alpha: Int) { drawableAlpha = alpha; invalidateSelf() }
         override fun getAlpha() = drawableAlpha
@@ -498,13 +521,7 @@ internal object KeyboardControls {
                     !group.canScrollHorizontally(-1) && !group.canScrollHorizontally(1))
             }
             if (touch.startedDrag) {
-                val cancel = MotionEvent.obtain(event)
-                try {
-                    cancel.action = MotionEvent.ACTION_CANCEL
-                    chain.proceed(arrayOf(cancel))
-                } finally {
-                    cancel.recycle()
-                }
+                cancelNativeTouch(chain, event)
                 captured = true
                 group.parent?.requestDisallowInterceptTouchEvent(true)
             }
@@ -622,6 +639,8 @@ internal object KeyboardControls {
         private val slop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
         private val chinese = resources.configuration.locales[0].language == "zh"
         private val transparent = ColorDrawable(Color.TRANSPARENT)
+        private val keyboardToStock = Matrix()
+        private val lowerKeyFace = RectF()
         private var stockBackground: Drawable? = null
         private var stockStripBottomPadding = strip.paddingBottom
         private var appliedStripBottomPadding: Int? = null
@@ -629,10 +648,9 @@ internal object KeyboardControls {
             private set
         private var adapter: Any? = null
         private var entries = emptyList<Any?>()
-        private var slots = 0
-        private var visiblePage = -1
+        private var rowsPerPage = 0
+        private var visiblePage = 0
         private var dark = style.dark()
-        private var page = 0
         private var pageCount = 1
         private val menu = NumericMenu(style, context)
         private val nextLabel = TextView(context).apply {
@@ -682,11 +700,18 @@ internal object KeyboardControls {
         }.apply {
             isFocusable = true
             addView(nextLabel, FrameLayout.LayoutParams(-1, -1))
-            background = ButtonBackground(style, this, null)
+            // Keep the face in this view while the click updates its label and the menu's layout.
+            background = ButtonBackground(style, this, null, false)
             setOnClickListener {
-                if (numericTray !== this@NumericTray) return@setOnClickListener
-                page = (page + 1) % pageCount
-                updateNumericTray(stock) { if (!sync()) releaseNumericTray() }
+                val currentAdapter = adapter ?: return@setOnClickListener
+                if (numericTray !== this@NumericTray || pageCount <= 1) return@setOnClickListener
+                updateNumericTray(stock) {
+                    if (native.adapter(stock) === currentAdapter && native.data(currentAdapter) == entries) {
+                        showPage(currentAdapter, entries, rowsPerPage, (visiblePage + 1) % pageCount)
+                    } else {
+                        this@NumericTray.postInvalidateOnAnimation()
+                    }
+                }
             }
         }
 
@@ -699,18 +724,21 @@ internal object KeyboardControls {
         }
 
         fun sync(): Boolean {
-            if (stock.visibility == GONE || !hidesStock && stock.visibility != VISIBLE || stock.width <= 0) return false
+            if (stock.visibility == GONE || !hidesStock && stock.visibility != VISIBLE) return false
+            val frame = stock.parentView() ?: return false
+            val keyboard = strip.parentView() ?: return false
+            // A mounted tray keeps its last measured layout through a native relayout.
+            if (stock.width <= 0 || hidesStock && (stock.isLayoutRequested || keyboard.isLayoutRequested)) return hidesStock
             val adapter = native.adapter(stock) ?: return false
             val data = native.data(adapter)
             if (data.isEmpty()) return false
-            val digit = native.digitLayout(strip.parentView() ?: return false, stock) ?: return false
-            val frame = stock.parentView() ?: return false
+            val digit = native.digitLayout(keyboard, stock) ?: return hidesStock
             val stockTop = (frame.y + stock.y).roundToInt()
             val stripHeightFromStock = strip.height - stockTop
             if (strip.paddingBottom != appliedStripBottomPadding) stockStripBottomPadding = strip.paddingBottom
             val originalHeight = minOf(stock.height, stripHeightFromStock - stockStripBottomPadding)
             val availableHeight = originalHeight - stock.paddingTop - stock.paddingBottom
-            if (availableHeight <= 0) return false
+            if (availableHeight <= 0) return hidesStock
 
             // The stock scroller reserves a footer inset that can stop above the last digit's face.
             val bottomPadding = (stripHeightFromStock - digit.bottom).coerceIn(0, stockStripBottomPadding)
@@ -720,15 +748,22 @@ internal object KeyboardControls {
             val nativeHeight = stock.getChildAt(0)?.height?.takeIf { it > 0 }?.toFloat() ?: 48f * density
             val slots = (availableHeight / nativeHeight).roundToInt().coerceAtLeast(2)
             val perPage = if (data.size <= slots) slots else slots - 1
-            updateLayout(digit, perPage)
+            val pageGap = if (data.size > slots) pageGap(keyboard, digit) else 0
+            updateLayout(digit, perPage, pageGap)
             val dark = style.dark()
-            if (this.adapter === adapter && entries == data && this.slots == slots && visiblePage == page && this.dark == dark) {
+            if (this.adapter === adapter && entries == data && rowsPerPage == perPage && this.dark == dark) {
                 menu.clearRowBackgrounds()
                 return true
             }
             nextLabel.setTextColor(CouiChipTabDefaults.contentColor(dark).toArgb())
-            pageCount = (data.size - 1) / perPage + 1
-            page = page.coerceIn(0, pageCount - 1)
+            showPage(adapter, data, perPage, visiblePage)
+            this.dark = dark
+            return true
+        }
+
+        private fun showPage(adapter: Any, data: List<Any?>, perPage: Int, requestedPage: Int) {
+            val pageCount = (data.size - 1) / perPage + 1
+            val page = requestedPage.coerceIn(0, pageCount - 1)
             val start = page * perPage
             val rows = (start until minOf(start + perPage, data.size)).map { position ->
                 native.createRow(stock, adapter, position, data[position]).apply {
@@ -749,20 +784,31 @@ internal object KeyboardControls {
             menu.setRows(rows, if (pageCount > 1) perPage - rows.size else 0)
             next.visibility = if (pageCount > 1) VISIBLE else GONE
             val last = page == pageCount - 1
-            nextLabel.text = if (chinese) { if (last) "首页" else "下页" } else { if (last) "First" else "Next" }
+            val label = if (chinese) { if (last) "首页" else "下页" } else { if (last) "First" else "Next" }
+            if (nextLabel.text != label) nextLabel.text = label
             next.contentDescription = if (chinese) {
                 val action = if (last) "回到第一页" else "下一页"
                 "符号第 ${page + 1} 页，共 $pageCount 页，$action"
-            } else "Symbol page ${page + 1} of $pageCount, ${nextLabel.text}"
+            } else "Symbol page ${page + 1} of $pageCount, $label"
             this.adapter = adapter
             entries = data
-            this.slots = slots
+            rowsPerPage = perPage
             visiblePage = page
-            this.dark = dark
-            return true
+            this.pageCount = pageCount
         }
 
-        private fun updateLayout(digit: NativeNumeric.DigitLayout, perPage: Int) {
+        private fun pageGap(keyboard: View, digit: NativeNumeric.DigitLayout): Int {
+            val controls = host ?: return digit.gap
+            val lowerKey = controls.findKey.invoke(keyboard, "S4_key_0", false) ?: return digit.gap
+            lowerKeyFace.set(controls.keyBounds.invoke(lowerKey) as Rect)
+            if (lowerKeyFace.isEmpty) return digit.gap
+            KeyboardLayers.localToRoot(keyboard, stock, keyboardToStock).mapRect(lowerKeyFace)
+            // The pager ends at 7's bottom. Mirror the gap below it on both sides of the pager.
+            val gap = lowerKeyFace.top.roundToInt() - digit.bottom
+            return if (gap in 0..(digit.bottom - digit.top) / 4) gap else digit.gap
+        }
+
+        private fun updateLayout(digit: NativeNumeric.DigitLayout, perPage: Int, pageGap: Int) {
             val bottom = (stock.height - digit.bottom).coerceAtLeast(0)
             if (paddingLeft != stock.paddingLeft || paddingTop != digit.top ||
                 paddingRight != stock.paddingRight || paddingBottom != bottom) {
@@ -774,8 +820,8 @@ internal object KeyboardControls {
                 menu.layoutParams = menuLayout
             }
             val nextLayout = next.layoutParams as LayoutParams
-            if (nextLayout.topMargin != digit.gap) {
-                nextLayout.topMargin = digit.gap
+            if (nextLayout.topMargin != pageGap) {
+                nextLayout.topMargin = pageGap
                 next.layoutParams = nextLayout
             }
             menu.setDigitFill(digit.fill)

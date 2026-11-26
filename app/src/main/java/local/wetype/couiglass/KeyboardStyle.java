@@ -3,9 +3,11 @@ package local.wetype.couiglass;
 import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.ColorFilter;
+import android.graphics.Matrix;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffColorFilter;
 import android.graphics.Rect;
+import android.graphics.RectF;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
@@ -17,7 +19,6 @@ import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 import android.view.Window;
 import android.view.WindowManager;
-import android.view.inputmethod.EditorInfo;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.TextView;
@@ -82,6 +83,7 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
     private final Method readDarkSkin;
     private final KeySurface material;
     private final IconButtonMotion motion = new IconButtonMotion();
+    private final ClipboardPreviewControls clipboardPreview = new ClipboardPreviewControls(this);
     private final KeyboardLayers layers = new KeyboardLayers(this);
     private final PageMotion pages = new PageMotion(this);
     private final Map<View, AppliedBackground> changed = new WeakHashMap<>();
@@ -132,6 +134,10 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
     KeyboardLayers layers() { return layers; }
     PageMotion pages() { return pages; }
 
+    boolean fitLiftedPreview(View view, View root, RectF bounds, Matrix correction) {
+        return clipboardPreview.fitLiftedPreview(view, root, bounds, correction);
+    }
+
     View animationRoot() {
         return shown && rootReady && root != null && root.isShown() && root.isHardwareAccelerated()
                 && root.getWidth() > 0 && root.getHeight() > 0 ? root : null;
@@ -144,7 +150,7 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
     boolean isInputRoot(View view) { return shown && rootReady && view == root; }
 
     void observeButton(View view, MotionEvent event, boolean handled) {
-        if (!shown) return;
+        if (!shown || clipboardPreview.observeButton(root, view, event, handled)) return;
         View target = buttonTarget(view);
         if (target == null || !draws(view)) return;
         // RecyclerView and paged grids can cancel a child while the finger stays on the IME.
@@ -155,7 +161,7 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
     }
 
     private View buttonTarget(View view) {
-        if (view.getBackground() instanceof ButtonBackground) return view;
+        if (ButtonBackground.find(view.getBackground()) != null) return view;
         if (view.getId() == CANDIDATE_RIGHT || view.getId() == CANDIDATE_PACK_UP_WRAPPER) {
             View action = candidateActionIn(view);
             if (action != null && action.getBackground() instanceof ButtonBackground) return action;
@@ -242,7 +248,10 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
             styleClipboardRows(PHRASE_LIST, PHRASE_ENTRY, PHRASE_TEXT);
         }
         if (shown && rootReady) KeyboardControls.syncNumericTray(this, root);
-        return !updateCandidateLayout();
+        if (shown && rootReady) layers.syncCandidateGrid();
+        boolean previewLayoutChanged = shown && rootReady
+                && clipboardPreview.sync(root.findViewById(CANDIDATE_NORMAL_CONTAINER));
+        return !updateCandidateLayout() && !previewLayoutChanged;
     }
 
     private void styleClipboardRows(int listId, int cardId, int textId) {
@@ -380,7 +389,10 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
         int width = Math.min(toolbarSlot.width(), availableWidth);
         int height = Math.min(toolbarSlot.height(), availableHeight);
         int left = candidateBarPosition[0] + toolbarSlot.left - actionParentPosition[0] - wrapper.getPaddingLeft();
-        int top = candidateBarPosition[1] + toolbarSlot.top - actionParentPosition[1] - wrapper.getPaddingTop();
+        int clipboardPreviewCenter = clipboardPreview.center();
+        int desiredTop = clipboardPreviewCenter >= 0 && wrapper.getId() == CANDIDATE_RIGHT
+                ? clipboardPreviewCenter - height / 2 : candidateBarPosition[1] + toolbarSlot.top;
+        int top = desiredTop - actionParentPosition[1] - wrapper.getPaddingTop();
         left = Math.max(0, Math.min(left, availableWidth - width));
         top = Math.max(0, Math.min(top, availableHeight - height));
         if (layout == alignedActionLayout && layout.width == width && layout.height == height
@@ -430,6 +442,7 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
             Drawable current = view.getBackground();
             if (current != background.replacement && visible(view)
                     && (background.panel || background.replacement instanceof SegmentedTabs
+                        || background.replacement instanceof SymbolCategories
                         || hasTabBackground(current) && insideSegmentedTabs(view))) return true;
         }
         return false;
@@ -454,6 +467,7 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
         layers.clear();
         pages.clear();
         restoreCandidateButton();
+        clipboardPreview.clear();
         if (observer != null && observer.isAlive()) {
             observer.removeOnGlobalLayoutListener(this);
             observer.removeOnPreDrawListener(this);
@@ -495,7 +509,7 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
                 Window window = service.getWindow().getWindow();
                 if (window != null) {
                     if (backdrop == null) backdrop = new KeyboardBackdrop(window, root);
-                    ownsPanel = backdrop.apply(dark, systemBlur, searchPageColor());
+                    ownsPanel = backdrop.apply(dark, systemBlur);
                 }
             }
             if (!ownsPanel) {
@@ -687,6 +701,7 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
     }
 
     private boolean isButton(View view, Zone zone, boolean boundary) {
+        if (ClipboardPreviewControls.ownsButton(view)) return false;
         if (keyView != null && keyView.isInstance(view)) return true;
         if (zone == Zone.EMOJI && view.getId() == EMOJI_CATEGORY) return true;
         if (zone == Zone.TOOLBAR && ToolbarPager.isPageButton(view)) return true;
@@ -818,16 +833,6 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
             }
         }
         return isSystemDark();
-    }
-
-    private int searchPageColor() {
-        EditorInfo editor = service.getCurrentInputEditorInfo();
-        if (editor == null || !"com.twitter.android".equals(editor.packageName)
-                || (editor.imeOptions & EditorInfo.IME_MASK_ACTION) != EditorInfo.IME_ACTION_SEARCH) {
-            return Color.TRANSPARENT;
-        }
-        // X's search content ends at the IME inset, leaving no app pixels under the panel.
-        return isSystemDark() ? 0xFF030303 : Color.WHITE;
     }
 
     private boolean isSystemDark() {

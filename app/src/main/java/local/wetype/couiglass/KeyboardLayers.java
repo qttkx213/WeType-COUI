@@ -1,16 +1,13 @@
 package local.wetype.couiglass;
 
-import android.graphics.BlendMode;
 import android.graphics.Canvas;
+import android.graphics.Color;
 import android.graphics.Matrix;
-import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RecordingCanvas;
 import android.graphics.Rect;
 import android.graphics.RectF;
-import android.graphics.RenderEffect;
 import android.graphics.RenderNode;
-import android.graphics.Shader;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -26,26 +23,32 @@ import io.github.libxposed.api.XposedInterface;
 final class KeyboardLayers {
     private final KeyboardStyle style;
     private final RenderNode keyboard = new RenderNode("WeType keyboard content");
-    private final RenderNode blurred = new RenderNode("WeType key backdrop");
+    private final CouiBackdropBlur blurred = new CouiBackdropBlur();
+    private final CandidateGridBackdrop candidateGrid = new CandidateGridBackdrop();
+    private final ExpandedCandidates expandedCandidates;
     private final Map<Object, LiftedKey> lifted = new IdentityHashMap<>();
     private final List<LiftedKey> foreground = new ArrayList<>();
     private final Path blurMask = new Path();
     private final Path facePath = new Path();
     private final RectF faceBounds = new RectF();
-    private final Rect sampleBounds = new Rect();
-    private final Paint blurMix = new Paint();
+    private final Matrix previewFit = new Matrix();
     private View root;
     private SymbolPopup popup;
     private boolean recording;
-    private float blurRadius;
 
     KeyboardLayers(KeyboardStyle style) {
         this.style = style;
+        expandedCandidates = new ExpandedCandidates(style);
         keyboard.setClipToBounds(false);
-        blurMix.setBlendMode(BlendMode.PLUS);
     }
 
     void bind(View view) { root = view; }
+    void syncCandidateGrid() {
+        expandedCandidates.sync(root);
+        candidateGrid.sync(style, root, expandedCandidates.getWordList(), expandedCandidates.getDeleteKey());
+    }
+    ExpandedCandidates expandedCandidates() { return expandedCandidates; }
+    CandidateGridBackdrop candidateGrid() { return candidateGrid; }
 
     void openPopup(View view, View body, Rect sourceKey) {
         if (root == null || !root.isHardwareAccelerated() || !(view.getParent() instanceof ViewGroup)) return;
@@ -64,23 +67,32 @@ final class KeyboardLayers {
     }
 
     void popupVisibilityChanging(View view, int visibility) {
-        if (!ownsPopup(view) || popup.getClosing() || view.getVisibility() == visibility) return;
+        if (popup == null || popup.getView() != view || popup.getClosing() || view.getVisibility() == visibility) return;
         if (visibility == View.VISIBLE) popup.open();
         else if (view.getVisibility() == View.VISIBLE) closePopup(view);
     }
 
-    boolean ownsPopup(View view) { return popup != null && popup.getView() == view; }
+    private SymbolPopup popupFor(View view) {
+        if (popup != null && popup.getView() == view) return popup;
+        SymbolPopup stroke = expandedCandidates.strokePopup();
+        return stroke != null && stroke.getView() == view ? stroke : null;
+    }
+
+    boolean ownsPopup(View view) { return popupFor(view) != null; }
 
     void invalidatePopup(View view) {
-        if (ownsPopup(view)) popup.invalidate();
+        SymbolPopup active = popupFor(view);
+        if (active != null) active.invalidate();
     }
 
     void observePopupTouch(View view, View source, MotionEvent event, int index) {
-        if (ownsPopup(view)) popup.observeTouch(source, event, index);
+        SymbolPopup active = popupFor(view);
+        if (active != null) active.observeTouch(source, event, index);
     }
 
     Object drawPopup(XposedInterface.Chain chain) throws Throwable {
-        return popup.drawHost(chain);
+        SymbolPopup active = popupFor((View) chain.getThisObject());
+        return active == null ? chain.proceed() : active.drawHost(chain);
     }
 
     void clear() {
@@ -88,7 +100,9 @@ final class KeyboardLayers {
         popup = null;
         lifted.clear();
         foreground.clear();
-        blurred.discardDisplayList();
+        blurred.clear();
+        candidateGrid.clear();
+        expandedCandidates.clear();
         keyboard.discardDisplayList();
         if (root != null) root.invalidate();
     }
@@ -96,8 +110,9 @@ final class KeyboardLayers {
     Object draw(XposedInterface.Chain chain, View root, Canvas canvas) throws Throwable {
         foreground.clear();
         SymbolPopup visiblePopup = popup != null && (popup.getClosing() || popup.getView().isShown()) ? popup : null;
+        SymbolPopup strokePopup = expandedCandidates.strokePopup();
         if (!canvas.isHardwareAccelerated() || root.getWidth() <= 0 || root.getHeight() <= 0
-                || (!style.motion().hasOverflow() && visiblePopup == null)) {
+                || (!style.motion().hasOverflow() && visiblePopup == null && strokePopup == null)) {
             lifted.clear();
             return canvas == chain.getArg(0) ? chain.proceed() : chain.proceed(new Object[]{canvas});
         }
@@ -126,7 +141,7 @@ final class KeyboardLayers {
                 keys.remove();
                 continue;
             }
-            float strength = press.backdropStrength();
+            float strength = candidateGrid.owns(key.view) ? 0f : press.backdropStrength();
             placeKey(root, key, strength > 0f);
             blurStrength = Math.max(blurStrength, strength);
             foreground.add(key);
@@ -135,8 +150,13 @@ final class KeyboardLayers {
             visiblePopup.addBackdrop(blurMask);
             blurStrength = Math.max(blurStrength, visiblePopup.getOpacity());
         }
+        if (strokePopup != null) {
+            strokePopup.addBackdrop(blurMask);
+            blurStrength = Math.max(blurStrength, strokePopup.getOpacity());
+        }
 
-        if (blurMask.isEmpty() || blurStrength <= 0f || !drawBlur(canvas, root, blurStrength)) {
+        if (blurMask.isEmpty() || blurStrength <= 0f || !blurred.draw(canvas, keyboard, blurMask, width, height,
+                7f * root.getResources().getDisplayMetrics().density, blurStrength, Color.TRANSPARENT)) {
             canvas.drawRenderNode(keyboard);
         }
         for (LiftedKey key : foreground) {
@@ -145,56 +165,9 @@ final class KeyboardLayers {
             canvas.drawRenderNode(key.content);
             canvas.restoreToCount(saved);
         }
+        // The native stroke labels were excluded from the recording by drawPopup(Chain).
+        if (strokePopup != null) strokePopup.drawPopup(canvas);
         return null;
-    }
-
-    private boolean drawBlur(Canvas canvas, View root, float strength) {
-        float radius = 7f * root.getResources().getDisplayMetrics().density;
-        blurMask.computeBounds(faceBounds, true);
-        // Include neighboring pixels in the Gaussian kernel, even outside the face.
-        faceBounds.roundOut(sampleBounds);
-        int padding = (int) Math.ceil(3f * radius);
-        sampleBounds.inset(-padding, -padding);
-        if (!sampleBounds.intersect(0, 0, root.getWidth(), root.getHeight())) return false;
-        boolean moved = blurred.setPosition(sampleBounds);
-        if (radius != blurRadius) {
-            blurRadius = radius;
-            // The window blur is below this layer. Keep empty pixels transparent and tint the face once.
-            blurred.setRenderEffect(RenderEffect.createBlurEffect(radius, radius, Shader.TileMode.CLAMP));
-        }
-        if (moved || !blurred.hasDisplayList()) {
-            RecordingCanvas sample = blurred.beginRecording();
-            try {
-                sample.translate(-sampleBounds.left, -sampleBounds.top);
-                sample.drawRenderNode(keyboard);
-            } finally {
-                blurred.endRecording();
-            }
-        }
-        int saved = canvas.save();
-        canvas.clipOutPath(blurMask);
-        canvas.drawRenderNode(keyboard);
-        canvas.restoreToCount(saved);
-
-        saved = canvas.save();
-        canvas.clipPath(blurMask);
-        if (strength >= .999f) {
-            canvas.drawRenderNode(blurred);
-        } else {
-            // Blend source pixels with their blurred counterpart before composing above the IME backdrop.
-            int mix = canvas.saveLayer(faceBounds, null);
-            int alpha = Math.round(strength * 255f);
-            int sharp = canvas.saveLayerAlpha(faceBounds, 255 - alpha);
-            canvas.drawRenderNode(keyboard);
-            canvas.restoreToCount(sharp);
-            blurMix.setAlpha(alpha);
-            int soft = canvas.saveLayer(faceBounds, blurMix);
-            canvas.drawRenderNode(blurred);
-            canvas.restoreToCount(soft);
-            canvas.restoreToCount(mix);
-        }
-        canvas.restoreToCount(saved);
-        return true;
     }
 
     boolean lift(View view, Object id, RectF face, float radius, IconButtonMotion.Press press,
@@ -234,13 +207,22 @@ final class KeyboardLayers {
         facePath.transform(key.transform);
         facePath.transform(key.mapping);
         facePath.computeBounds(faceBounds, true);
-        // The physical window is the remaining clip. Keep the whole face inside it on either side.
-        float horizontal = Math.max(0f, -faceBounds.left) - Math.max(0f, faceBounds.right - root.getWidth());
-        if (horizontal != 0f) {
-            key.mapping.postTranslate(horizontal, 0f);
-            facePath.offset(horizontal, 0f);
+        if (style.fitLiftedPreview(key.view, root, faceBounds, previewFit)) {
+            key.mapping.postConcat(previewFit);
+            facePath.transform(previewFit);
+        } else {
+            // Keep other raised faces inside the physical window.
+            float horizontal = horizontalShift(faceBounds, root.getWidth());
+            if (horizontal != 0f) {
+                key.mapping.postTranslate(horizontal, 0f);
+                facePath.offset(horizontal, 0f);
+            }
         }
         if (blur) blurMask.addPath(facePath);
+    }
+
+    static float horizontalShift(RectF bounds, int width) {
+        return Math.max(0f, -bounds.left) - Math.max(0f, bounds.right - width);
     }
 
     static Matrix localToRoot(View view, View root, Matrix into) {

@@ -29,14 +29,18 @@ import kotlin.math.roundToInt
 internal class SymbolPopup(
     private val root: View,
     val view: View,
-    private val body: View,
     private val sourceKey: Rect,
+    private val facePath: () -> Path?,
+    private val overlayHost: ViewGroup? = null,
 ) {
+    constructor(root: View, view: View, body: View, sourceKey: Rect) :
+        this(root, view, sourceKey, { SymbolMenu.face(body) }, view.parent as ViewGroup)
+
     private val location = IntArray(2)
     private val pivot = FloatArray(2)
     private val bounds = RectF()
     private val touchBounds = Rect()
-    private val host = view.parent as ViewGroup
+    private val host = overlayHost ?: root
     private val oldOutline = view.outlineProvider
     private val viewport = Rect()
     private val projected = RectF()
@@ -63,8 +67,11 @@ internal class SymbolPopup(
 
     init {
         view.outlineProvider = null
-        overlay.setBounds(0, 0, host.width, host.height)
-        host.overlay.add(overlay)
+        overlayHost?.let {
+            overlay.setBounds(0, 0, it.width, it.height)
+            it.overlay.add(overlay)
+        }
+        view.invalidate()
     }
 
     var closing = false
@@ -78,14 +85,16 @@ internal class SymbolPopup(
     fun close(onEnd: Runnable) {
         if (closing) return
         closing = true
-        val face = SymbolMenu.face(body)
-        if (!ValueAnimator.areAnimatorsEnabled() || opacity <= 0f || face == null || !view.isShown || !locate(face)) {
+        val face = facePath()
+        // The stroke row is merely INVISIBLE on fold and keeps its children for the exit frame.
+        if (!ValueAnimator.areAnimatorsEnabled() || opacity <= 0f || face == null ||
+            (overlayHost != null && !view.isShown) || !locate(face)) {
             onEnd.run()
             return
         }
         exitFace = Path(face)
         motion.clear()
-        // WeType recycles the menu's child views synchronously in its hide callback.
+        // Retain this frame through the exit even when WeType changes its child views.
         drawing = true
         try {
             frame = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888).also {
@@ -104,7 +113,7 @@ internal class SymbolPopup(
         animator?.cancel()
         animator = null
         motion.clear()
-        host.overlay.remove(overlay)
+        overlayHost?.overlay?.remove(overlay)
         view.outlineProvider = oldOutline
         view.invalidate()
         content.discardDisplayList()
@@ -113,7 +122,7 @@ internal class SymbolPopup(
     }
 
     fun invalidate() {
-        overlay.invalidateSelf()
+        if (overlayHost != null) overlay.invalidateSelf()
         root.invalidate()
     }
 
@@ -125,7 +134,7 @@ internal class SymbolPopup(
                 if (index !in 0 until event.pointerCount) return
                 if (active?.pointerId != event.getPointerId(index) || active.view !== source) {
                     // The menu opens after the held key has received DOWN. Begin at the first live position.
-                    val face = SymbolMenu.face(body) ?: return
+                    val face = facePath() ?: return
                     face.computeBounds(bounds, true)
                     bounds.roundOut(touchBounds)
                     motion.down(source, view, touchBounds, event, index)
@@ -133,24 +142,32 @@ internal class SymbolPopup(
                     motion.update(source, event)
                 }
             }
-            else -> active?.takeIf { it.pointerId >= 0 }?.release(event)
+            else -> releaseTouch(event)
         }
+    }
+
+    fun releaseTouch(event: MotionEvent?) {
+        motion.sample(view)?.takeIf { it.pointerId >= 0 }?.release(event)
     }
 
     fun addBackdrop(path: Path) {
         if (opacity <= 0f || scale <= 0f) return
-        val face = (if (closing) exitFace else SymbolMenu.face(body)) ?: return
+        val face = (if (closing) exitFace else facePath()) ?: return
         if (!locate(face)) return
         KeyboardLayers.localToRoot(host, root, inRoot)
         inRoot.preConcat(toHost)
         path.addPath(face, inRoot)
     }
 
-    fun drawHost(chain: XposedInterface.Chain): Any? = if (drawing) chain.proceed() else null
+    fun drawHost(chain: XposedInterface.Chain): Any? {
+        // Software snapshots draw the stroke row inline since PageMotion skips the root recording.
+        val softwareStroke = overlayHost == null && !(chain.getArg(0) as Canvas).isHardwareAccelerated
+        return if (drawing || softwareStroke) chain.proceed() else null
+    }
 
-    private fun drawPopup(canvas: Canvas) {
+    fun drawPopup(canvas: Canvas) {
         if (opacity <= 0f || scale <= 0f || !root.isShown || (!closing && !view.isShown)) return
-        val face = (if (closing) exitFace else SymbolMenu.face(body)) ?: return
+        val face = (if (closing) exitFace else facePath()) ?: return
         if (!locate(face)) return
         val saved = canvas.save()
         try {

@@ -69,52 +69,94 @@ internal class CouiSegmentButton(host: View, private val invalidate: () -> Unit)
     private var previewId = -1
     private var canGrab = false
     private var nativePressed = false
+    private var scrollable = false
+    private var scrollOffset = 0f
+    private var viewportDrag = false
 
     // Once the host received CANCEL, retain ownership until the stream ends.
     var isDragging = false
         private set
+    val isTrackingDrag get() = isDragging && pointer >= 0
 
-    fun update(track: RectF, slots: List<Slot>, selectedId: Int, enabled: Boolean = true) {
+    fun update(track: RectF, slots: List<Slot>, selectedId: Int, enabled: Boolean = true,
+        scrollable: Boolean = false,
+    ) {
         val targetBefore = targetId
         val wasNativeEnabled = nativePressed && this.enabled && slot(this.selectedId)?.enabled == true
         this.track.set(track)
         this.slots = slots
-        outerRadius = trackRadius(track, slots)
+        outerRadius = if (scrollable) minOf(track.width(), track.height()) / 2f else trackRadius(track, slots)
         this.selectedId = selectedId
         this.enabled = enabled
-        if (pointer >= 0 && (!enabled || slot(pressedId)?.enabled != true ||
-                isDragging && slot(previewId)?.enabled != true)) {
+        this.scrollable = scrollable
+        // A scrolling host can recycle the pressed view while the drag is still active.
+        val keepDrag = scrollable && isDragging
+        if (pointer >= 0 && (!enabled || !keepDrag && (slot(pressedId)?.enabled != true ||
+                isDragging && slot(previewId)?.enabled != true))) {
             release()
         }
-        select(slot(if (isDragging && pointer >= 0) previewId else selectedId))
+        if (!viewportDrag) select(slot(if (isTrackingDrag) previewId else selectedId))
+        if (scrollable && isTrackingDrag) followDrag(dragPosition(fingerX))
         if (nativePressed) {
             val nativeEnabled = enabled && slot(selectedId)?.enabled == true
             if (targetId != targetBefore || wasNativeEnabled != nativeEnabled) updateNativePress()
         }
     }
 
+    /** During edge scrolling, the indicator follows the pointer in viewport coordinates until release. */
+    fun anchorDragToViewport() {
+        if (!scrollable || !isTrackingDrag || viewportDrag || !indicatorRect(ValueAnimator.areAnimatorsEnabled())) return
+        viewportDrag = true
+        position.snapTo(indicator.centerX())
+        scrollOffset = 0f
+        rubberOrigin = null
+        rubber.snapTo(0f)
+        followDrag(dragPosition(fingerX))
+    }
+
     fun draw(canvas: Canvas, style: KeyboardStyle, alpha: Int = 255, indicatorColor: Int? = null) {
+        drawTrack(canvas, style, alpha)
+        drawIndicator(canvas, style, alpha, indicatorColor)
+    }
+
+    fun drawTrack(canvas: Canvas, style: KeyboardStyle, alpha: Int) {
         if (alpha <= 0 || track.isEmpty) return
         val dark = style.dark()
-        val material = style.material()
-        val fill = CouiPalette.topBarFill(dark, 255)
-        val outline = material.outline(track.width(), track.height(), outerRadius)
-
+        val outline = style.material().outline(track.width(), track.height(), outerRadius)
         val saved = canvas.save()
         try {
             canvas.translate(track.left, track.top)
-            trackSurface.draw(canvas, outline, track.width(), track.height(), outerRadius, fill, alpha, dark)
-            if (!indicatorRect(ValueAnimator.areAnimatorsEnabled())) return
+            trackSurface.draw(canvas, outline, track.width(), track.height(), outerRadius,
+                CouiPalette.topBarFill(dark, 255), alpha, dark)
+        } finally {
+            canvas.restoreToCount(saved)
+        }
+    }
 
-            if (scrollsThroughEnds()) {
-                // Keep the selection centered on its scrolling label and clip inside the track rim.
-                val gap = inset(track, targetBounds.height()).coerceAtMost(track.width() / 4f)
+    fun clipTrack(canvas: Canvas, style: KeyboardStyle) {
+        canvas.translate(track.left, track.top)
+        canvas.clipPath(style.material().outline(track.width(), track.height(), outerRadius))
+        canvas.translate(-track.left, -track.top)
+    }
+
+    fun drawIndicator(canvas: Canvas, style: KeyboardStyle, alpha: Int, indicatorColor: Int? = null) {
+        if (alpha <= 0 || !indicatorRect(ValueAnimator.areAnimatorsEnabled())) return
+        val dark = style.dark()
+        val material = style.material()
+        val fill = CouiPalette.topBarFill(dark, 255)
+        val saved = canvas.save()
+        try {
+            canvas.translate(track.left, track.top)
+
+            if (scrollable || scrollsThroughEnds()) {
+                // Clip inside the same track rim even when its end cells change.
+                val gap = scrollInset()
                 canvas.translate(gap, gap)
                 canvas.clipPath(material.outline(track.width() - 2f * gap, track.height() - 2f * gap,
                     (outerRadius - gap).coerceAtLeast(0f)))
                 canvas.translate(-gap, -gap)
             } else {
-                canvas.clipPath(outline)
+                canvas.clipPath(material.outline(track.width(), track.height(), outerRadius))
             }
 
             val width = indicator.width()
@@ -159,7 +201,7 @@ internal class CouiSegmentButton(host: View, private val invalidate: () -> Unit)
         if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
             val captured = isDragging
             val result = if (captured && action == MotionEvent.ACTION_UP && !cancelled) {
-                releaseSlot(event.getX(index))?.takeIf { it.id != selectedId }
+                releaseDrag(event.getX(index))?.takeIf { it.id != selectedId }
             } else null
             isDragging = false
             release(result ?: slot(selectedId))
@@ -186,19 +228,7 @@ internal class CouiSegmentButton(host: View, private val invalidate: () -> Unit)
             previewId = selectedId
         }
         if (isDragging) {
-            val next = dragSlot(fingerX)
-            if (next != null && next.id != previewId) {
-                previewId = next.id
-                select(next)
-                pressIndicator(next)
-                owner.get()?.let { view ->
-                    if (!view.performHapticFeedback(COUI_SWITCH_HAPTIC)) {
-                        view.performHapticFeedback(HapticFeedbackConstants.TEXT_HANDLE_MOVE)
-                    }
-                }
-            } else {
-                slot(previewId)?.let { followRubber(it, fingerX) }
-            }
+            followDrag(dragPosition(fingerX))
         } else if (hitId(fingerX, fingerY) != pressedId) {
             pressIndicator(null)
         } else if (canGrab) {
@@ -206,6 +236,46 @@ internal class CouiSegmentButton(host: View, private val invalidate: () -> Unit)
         }
         invalidate()
         return if (started) dragStarted else if (isDragging) consumed else pass
+    }
+
+    private fun dragPosition(x: Float): Float {
+        if (!scrollable || track.isEmpty) return x
+        // Sample inside the viewport when the finger is held over a fading edge.
+        val gap = minOf(3f * switchDistance, track.width() / 4f)
+        return x.coerceIn(track.left + gap, track.right - gap)
+    }
+
+    private fun releaseDrag(x: Float): Slot? {
+        val inside = dragPosition(x)
+        if (inside != x) {
+            // Keep the last preview while a new slot is still crossing the edge's switch threshold.
+            val preview = dragSlot(inside) ?: slot(previewId)?.takeIf { it.enabled }
+            if (preview != null) return preview
+        }
+        return releaseSlot(inside)
+    }
+
+    private fun followDrag(x: Float) {
+        if (viewportDrag) {
+            val margin = maxOf(targetBounds.width() / 2f + scrollInset(), outerRadius)
+            val reach = (track.width() / 2f - margin).coerceAtLeast(0f)
+            position.springTo(x.coerceIn(track.centerX() - reach, track.centerX() + reach), .25f)
+        }
+        val next = dragSlot(x) ?: if (scrollable && slot(previewId) == null) releaseSlot(x) else null
+        if (next != null && next.id != previewId) {
+            previewId = next.id
+            if (!viewportDrag) {
+                select(next)
+                pressIndicator(next)
+            }
+            owner.get()?.let { view ->
+                if (!view.performHapticFeedback(COUI_SWITCH_HAPTIC)) {
+                    view.performHapticFeedback(HapticFeedbackConstants.TEXT_HANDLE_MOVE)
+                }
+            }
+        } else if (!viewportDrag) {
+            slot(previewId)?.let { followRubber(it, x) }
+        }
     }
 
     /** Follows a popup's native selection and pointer. The native dispatcher owns its haptic and commit. */
@@ -242,11 +312,26 @@ internal class CouiSegmentButton(host: View, private val invalidate: () -> Unit)
     }
 
     private fun release(target: Slot? = slot(selectedId)) {
+        val viewportCenter = if (viewportDrag && indicatorRect(ValueAnimator.areAnimatorsEnabled())) {
+            indicator.centerX()
+        } else null
+        viewportDrag = false
         pointer = -1
         pressedId = -1
         previewId = -1
         canGrab = false
-        select(target)
+        if (viewportCenter != null && target != null) {
+            // Start the release at the drawn position, even if the preview ID stayed the same.
+            targetId = target.id
+            targetBounds.set(target.bounds)
+            position.snapTo(viewportCenter)
+            position.springTo(targetBounds.centerX(), .4f, .1f)
+            widthLimit = maxOf(widthLimit, targetBounds.width())
+            width.springTo(targetBounds.width(), .6f)
+            height.springTo(targetBounds.height(), .6f)
+        } else {
+            select(target)
+        }
         pressIndicator(null)
         rubber.springTo(0f, .6f)
     }
@@ -298,9 +383,20 @@ internal class CouiSegmentButton(host: View, private val invalidate: () -> Unit)
         if (id == targetId && (slot == null || targetBounds == slot.bounds)) return
         val wasVisible = targetId != -1
         val changed = id != targetId
+        val bounds = slot?.bounds
+        if (scrollable && !changed && bounds != null && bounds.top == targetBounds.top &&
+            bounds.bottom == targetBounds.bottom && abs(bounds.width() - targetBounds.width()) < .01f) {
+            // Move the running spring with its RecyclerView slot instead of restarting it on every scroll frame.
+            val dx = bounds.centerX() - targetBounds.centerX()
+            scrollOffset += dx
+            rubberAnchor += dx
+            targetBounds.set(bounds)
+            return
+        }
         val previousCenter = visibleCenter()
         val previousWidth = targetBounds.width()
         targetId = id
+        scrollOffset = 0f
         rubberOrigin = null
         rubber.snapTo(0f)
         if (slot == null) {
@@ -341,15 +437,17 @@ internal class CouiSegmentButton(host: View, private val invalidate: () -> Unit)
     }
 
     private fun visibleCenter(): Float {
-        val first = slots.firstOrNull() ?: return position.value
+        val center = position.value + scrollOffset
+        if (scrollable) return center + rubber.value
+        val first = slots.firstOrNull() ?: return center
         val last = slots.last()
-        return position.value.coerceIn(first.bounds.centerX(), last.bounds.centerX()) + rubber.value
+        return center.coerceIn(first.bounds.centerX(), last.bounds.centerX()) + rubber.value
     }
 
     private fun indicatorRect(animate: Boolean): Boolean {
-        if (targetId == -1 || slots.isEmpty() || track.isEmpty) return false
+        if (targetId == -1 || track.isEmpty || (slots.isEmpty() && !viewportDrag)) return false
         val scale = if (animate) press.value else 1f
-        val center = if (animate) visibleCenter() else targetBounds.centerX()
+        val center = if (animate || viewportDrag) visibleCenter() else targetBounds.centerX()
         val y = targetBounds.centerY()
         val w = if (animate) width.value.coerceIn(0f, widthLimit) else targetBounds.width()
         val h = if (animate) maxOf(height.value, targetBounds.height() * .9f) else targetBounds.height()
@@ -358,6 +456,15 @@ internal class CouiSegmentButton(host: View, private val invalidate: () -> Unit)
         val halfHeight = minOf(h / 2f - shrink, targetBounds.height() / 2f)
         if (halfHeight <= 0f) return false
         val gap = inset(track, 2f * halfHeight)
+        if (scrollable) {
+            // A clipped cell can be narrow. Keep the capsule round and let the fixed track clip it.
+            val maxHalfWidth = track.width() / 2f - scrollInset()
+            val minHalfWidth = (outerRadius - gap).coerceIn(0f, maxHalfWidth)
+            val halfWidth = (w / 2f - shrink).coerceIn(minHalfWidth, maxHalfWidth)
+            if (halfWidth <= 0f) return false
+            indicator.set(center - halfWidth, y - halfHeight, center + halfWidth, y + halfHeight)
+            return true
+        }
         val first = slots.first().bounds.left
         val last = slots.last().bounds.right
         val scrolling = scrollsThroughEnds()
@@ -374,6 +481,8 @@ internal class CouiSegmentButton(host: View, private val invalidate: () -> Unit)
         indicator.set(x - halfWidth, y - halfHeight, x + halfWidth, y + halfHeight)
         return true
     }
+
+    private fun scrollInset() = inset(track, targetBounds.height()).coerceAtMost(track.width() / 4f)
 
     private fun scrollsThroughEnds() = slots.first().bounds.left < track.left || slots.last().bounds.right > track.right
 
@@ -392,7 +501,7 @@ internal class CouiSegmentButton(host: View, private val invalidate: () -> Unit)
         val slack = ((1f - press.value) * width.value / 2f).coerceAtLeast(0f)
         val limit = slack + if (atEdge) 0f else switchDistance
         val offset = if (limit > 0f) (1f - 1f / (1f + abs(delta) * .12f / limit)) * limit * sign(delta) else 0f
-        rubber.springTo(rubberAnchor - position.value + offset, .6f)
+        rubber.springTo(rubberAnchor - position.value - scrollOffset + offset, .6f)
     }
 
     private class Axis(initial: Float, private val threshold: Float, private val invalidate: () -> Unit) {
@@ -430,27 +539,21 @@ internal class CouiSegmentButton(host: View, private val invalidate: () -> Unit)
     }
 
     private class Surface(private val density: Float, private val indicator: Boolean) {
-        private val lineWidth = (if (indicator) 1.7f else 2f) * density
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val rim = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = lineWidth
-        }
-        private val gradient = LinearGradient(0f, 0f, 0f, 1f,
-            intArrayOf(0xBFFFFFFF.toInt(), 0x22FFFFFF, 0xE6FFFFFF.toInt()), null, Shader.TileMode.CLAMP)
-        private val gradientScale = Matrix()
+        private val rim = CouiSegmentRim(density, indicator)
+
         private var contour: CouiContour? = null
         private var shaderFailed = false
 
         fun draw(canvas: Canvas, shape: Path, width: Float, height: Float, radius: Float, tint: Int, alpha: Int, dark: Boolean) {
             val color = CouiPalette.fade(tint, alpha)
-            val edge = if (indicator) (if (dark) .12f else .62f) else (if (dark) .60f else .50f)
+            val edge = rim.opacity(dark)
             val glow = if (indicator) 0f else (if (dark) .04f else .12f)
             val shader = if (Build.VERSION.SDK_INT >= 33 && canvas.isHardwareAccelerated && !shaderFailed) {
                 try {
                     val effect = contour ?: CouiContour(style = CouiContourStyle.Button).also { contour = it }
                     effect.shader(Size(width, height), density, radius, CouiCorners.WEIGHT, Color(color),
-                        glow, edge, alpha / 255f, lineWidth)
+                        glow, edge, alpha / 255f, rim.lineWidth)
                 } catch (_: RuntimeException) {
                     shaderFailed = true
                     null
@@ -465,14 +568,7 @@ internal class CouiSegmentButton(host: View, private val invalidate: () -> Unit)
             if (shader != null) return
 
             // The popup's closing bitmap also needs the rim on a software canvas.
-            gradientScale.setScale(1f, height)
-            gradient.setLocalMatrix(gradientScale)
-            rim.shader = gradient
-            rim.alpha = (alpha * edge).roundToInt()
-            val saved = canvas.save()
-            canvas.clipPath(shape)
-            canvas.drawPath(shape, rim)
-            canvas.restoreToCount(saved)
+            rim.draw(canvas, shape, 0f, height, alpha, dark)
         }
     }
 
@@ -507,5 +603,31 @@ internal class CouiSegmentButton(host: View, private val invalidate: () -> Unit)
             }
             return bounds.takeUnless { it.isEmpty }
         }
+    }
+}
+
+/** Draws the segment's gradient highlight inside an existing outline. */
+internal class CouiSegmentRim(density: Float, private val indicator: Boolean) {
+    val lineWidth = (if (indicator) 1.7f else 2f) * density
+    private val rim = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = lineWidth
+    }
+    private val gradient = LinearGradient(0f, 0f, 0f, 1f,
+        intArrayOf(0xBFFFFFFF.toInt(), 0x22FFFFFF, 0xE6FFFFFF.toInt()), null, Shader.TileMode.CLAMP)
+    private val scale = Matrix()
+
+    fun opacity(dark: Boolean) = if (indicator) (if (dark) .12f else .62f) else (if (dark) .60f else .50f)
+
+    fun draw(canvas: Canvas, shape: Path, top: Float, height: Float, alpha: Int, dark: Boolean) {
+        scale.setScale(1f, height)
+        scale.postTranslate(0f, top)
+        gradient.setLocalMatrix(scale)
+        rim.shader = gradient
+        rim.alpha = (alpha * opacity(dark)).roundToInt()
+        val saved = canvas.save()
+        canvas.clipPath(shape)
+        canvas.drawPath(shape, rim)
+        canvas.restoreToCount(saved)
     }
 }

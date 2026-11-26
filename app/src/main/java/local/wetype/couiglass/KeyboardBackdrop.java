@@ -5,7 +5,7 @@ package local.wetype.couiglass;
 
 import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.Paint;
+import android.graphics.Point;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
@@ -14,9 +14,11 @@ import android.graphics.drawable.Drawable;
 import android.graphics.drawable.DrawableWrapper;
 import android.graphics.drawable.LayerDrawable;
 import android.util.Log;
+import android.view.RoundedCorner;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
+import android.view.WindowInsets;
 import android.view.WindowManager;
 
 import java.lang.reflect.Field;
@@ -35,16 +37,17 @@ final class KeyboardBackdrop {
     private boolean blurFailed;
     private boolean reportedReuse;
     private boolean usedBlur;
-    private int tint;
-    private int backing;
-    private float radius;
+    private final int[] panelLocation = new int[2];
+    private Corners corners;
+    private boolean dark;
+    private float density;
 
     KeyboardBackdrop(Window window, View root) {
         this.window = window;
         this.root = root;
     }
 
-    boolean apply(boolean dark, boolean enabled, int pageColor) {
+    boolean apply(boolean dark, boolean enabled) {
         if (root.getWidth() <= 0 || root.getHeight() <= 0 || !root.isAttachedToWindow()) return false;
         if (hasExistingBlur()) {
             restore();
@@ -55,20 +58,19 @@ final class KeyboardBackdrop {
             return false;
         }
         float density = root.getResources().getDisplayMetrics().density;
-        boolean blur = pageColor == Color.TRANSPARENT && enabled && !blurFailed && root.isHardwareAccelerated();
-        int color = CouiPalette.panel(dark, blur);
-        float maxCorner = Math.min(root.getWidth(), root.getHeight()) / 2f;
-        float corner = Math.min((blur ? 20f : 24f) * density, maxCorner);
+        boolean blur = enabled && !blurFailed && root.isHardwareAccelerated();
+        Corners nextCorners = corners(density);
         Drawable background = root.getBackground();
         if (installedRoot == null || background != installedRoot) originalRoot = background;
-        if (installedRoot == null || color != tint || pageColor != backing || corner != radius || usedBlur != blur) {
+        if (installedRoot == null || this.dark != dark || this.density != density
+                || !nextCorners.equals(corners) || usedBlur != blur) {
             if (installedRoot != null) installedRoot.setVisible(false, false);
-            Drawable region = blur ? createBlurDrawable(density, corner) : null;
+            Drawable region = blur ? createBlurDrawable(density, nextCorners) : null;
             usedBlur = region != null;
-            tint = CouiPalette.panel(dark, usedBlur);
-            backing = pageColor;
-            radius = corner;
-            installedRoot = new Panel(region, usedBlur ? corner : Math.min(24f * density, maxCorner), tint, pageColor);
+            corners = nextCorners;
+            this.dark = dark;
+            this.density = density;
+            installedRoot = new Panel(region, corners, CouiPalette.panel(dark, usedBlur), density, dark);
             KeyboardStyle.invalidateTree(root);
         }
         if (background != installedRoot) KeyboardStyle.setBackground(root, installedRoot);
@@ -104,7 +106,38 @@ final class KeyboardBackdrop {
         installedWindow = null;
     }
 
-    private Drawable createBlurDrawable(float density, float corner) {
+    private Corners corners(float density) {
+        float maxCorner = Math.min(root.getWidth(), root.getHeight()) / 2f;
+        float top = Math.min(20f * density, maxCorner);
+        WindowInsets insets = root.getRootWindowInsets();
+        if (insets == null) return new Corners(top, 0f, 0f);
+        root.getLocationInWindow(panelLocation);
+        int left = panelLocation[0];
+        int right = left + root.getWidth();
+        int bottom = panelLocation[1] + root.getHeight();
+        return new Corners(top,
+                bottomCorner(insets.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_LEFT), left, bottom, true, maxCorner),
+                bottomCorner(insets.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_RIGHT), right, bottom, false, maxCorner));
+    }
+
+    private static float bottomCorner(RoundedCorner corner, int side, int bottom, boolean left, float limit) {
+        if (corner == null) return 0f;
+        Point center = corner.getCenter();
+        int radius = corner.getRadius();
+        int outerSide = center.x + (left ? -radius : radius);
+        int outerBottom = center.y + radius;
+        if (Math.abs(side - outerSide) > 1 || Math.abs(bottom - outerBottom) > 1) return 0f;
+        return Math.min(radius, limit);
+    }
+
+    private record Corners(float top, float bottomLeft, float bottomRight) {
+        float[] radii() {
+            return new float[]{top, top, top, top, bottomRight, bottomRight, bottomLeft, bottomLeft};
+        }
+    }
+
+    // Only Android's compositor can sample the app below the screen-sized IME window.
+    private Drawable createBlurDrawable(float density, Corners corners) {
         Drawable blur = null;
         try {
             Object viewRoot = View.class.getMethod("getViewRootImpl").invoke(root);
@@ -113,7 +146,7 @@ final class KeyboardBackdrop {
             blur = (Drawable) createRegion.invoke(viewRoot);
             Class<?> type = blur.getClass();
             type.getMethod("setCornerRadius", float.class, float.class, float.class, float.class)
-                    .invoke(blur, corner, corner, 0f, 0f);
+                    .invoke(blur, corners.top(), corners.top(), corners.bottomLeft(), corners.bottomRight());
             type.getMethod("setColor", int.class).invoke(blur, Color.TRANSPARENT);
             // One window sample covers the toolbar and keys throughout press and page animations.
             type.getMethod("setBlurRadius", int.class).invoke(blur, Math.round(30f * density));
@@ -128,48 +161,36 @@ final class KeyboardBackdrop {
     }
 
     private static final class Panel extends DrawableWrapper {
-        private final float corner;
+        private final Corners corners;
         private final int color;
-        private final int pageColor;
-        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private Path shape = new Path();
+        private final KeyboardPanelLight light;
+        private final Path shape = new Path();
         private int alpha = 255;
 
-        Panel(Drawable blur, float corner, int color, int pageColor) {
+        Panel(Drawable blur, Corners corners, int color, float density, boolean dark) {
             super(blur);
-            this.corner = corner;
+            this.corners = corners;
             this.color = color;
-            this.pageColor = pageColor;
+            light = new KeyboardPanelLight(density, dark);
         }
 
         @Override protected void onBoundsChange(Rect bounds) {
             super.onBoundsChange(bounds);
-            if (bounds.isEmpty()) {
-                shape.reset();
-                return;
-            }
-            float width = bounds.width();
-            float height = bounds.height();
-            if (getDrawable() != null) {
-                // Match the compositor's per-corner radii so the tint and blur share one edge.
-                shape = new Path();
-                shape.addRoundRect(bounds.left, bounds.top, bounds.right, bounds.bottom,
-                        new float[]{corner, corner, corner, corner, 0f, 0f, 0f, 0f}, Path.Direction.CW);
-            } else {
-                shape = CouiCorners.path(width, height, corner);
-                shape.addRect(0f, height / 2f, width, height, Path.Direction.CW);
-                shape.offset(bounds.left, bounds.top);
+            shape.rewind();
+            if (!bounds.isEmpty()) {
+                shape.addRoundRect(0f, 0f, bounds.width(), bounds.height(), corners.radii(), Path.Direction.CW);
             }
         }
 
         @Override public void draw(Canvas canvas) {
-            if (pageColor != Color.TRANSPARENT) {
-                paint.setColor(CouiPalette.fade(pageColor, alpha));
-                canvas.drawRect(getBounds(), paint);
-            }
+            Rect bounds = getBounds();
+            if (bounds.isEmpty()) return;
             if (canvas.isHardwareAccelerated()) super.draw(canvas);
-            paint.setColor(CouiPalette.fade(color, alpha));
-            canvas.drawPath(shape, paint);
+            int saved = canvas.save();
+            canvas.translate(bounds.left, bounds.top);
+            light.draw(canvas, shape, bounds.width(), bounds.height(), corners.top(), corners.bottomLeft(),
+                    corners.bottomRight(), CouiPalette.fade(color, alpha));
+            canvas.restoreToCount(saved);
         }
 
         @Override public void setAlpha(int alpha) {
@@ -180,10 +201,7 @@ final class KeyboardBackdrop {
         }
 
         @Override public int getAlpha() { return alpha; }
-        @Override public int getOpacity() {
-            return pageColor != Color.TRANSPARENT && alpha == 255
-                    ? PixelFormat.OPAQUE : PixelFormat.TRANSLUCENT;
-        }
+        @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
     }
 
     private boolean hasExistingBlur() {

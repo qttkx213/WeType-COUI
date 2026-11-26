@@ -4,9 +4,9 @@ final class CouiPalette {
     private CouiPalette() {}
 
     static int panel(boolean dark, boolean blurred) {
-        // Match the neutral grays in the reference images on similar app backgrounds.
-        if (dark) return blurred ? 0x920E0E0E : 0xFF0F1014;
-        return blurred ? 0x88CFCFD3 : 0xFFDDDDDF;
+        // The elevated neutral in Apple Dark Mode keeps its hue over a black backdrop.
+        if (dark) return blurred ? 0xA81C1C1E : 0xFF1C1C1E;
+        return blurred ? 0xA8BDC2CB : 0xFFD4D7DD;
     }
 
     static int topBarFill(boolean dark, int opacity) {

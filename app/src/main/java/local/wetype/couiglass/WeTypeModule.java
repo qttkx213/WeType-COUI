@@ -2,6 +2,7 @@ package local.wetype.couiglass;
 
 import android.app.Application;
 import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.inputmethodservice.InputMethodService;
 import android.util.Log;
@@ -28,6 +29,7 @@ public final class WeTypeModule extends XposedModule {
     private Method darkSkin;
     private InputMethodService service;
     private KeyboardStyle style;
+    private boolean overlayDemoSearch;
 
     @Override public void onModuleLoaded(ModuleLoadedParam param) {
         processName = param.getProcessName();
@@ -73,7 +75,10 @@ public final class WeTypeModule extends XposedModule {
             });
             intercept(startInput, chain -> {
                 Object result = chain.proceed();
-                if (owns(chain)) style.refresh();
+                if (owns(chain)) {
+                    updateDemoSearch((EditorInfo) chain.getArg(0));
+                    style.refresh();
+                }
                 return result;
             });
             intercept(shown, chain -> {
@@ -102,6 +107,7 @@ public final class WeTypeModule extends XposedModule {
                     style.unbind();
                     style = null;
                     service = null;
+                    overlayDemoSearch = false;
                 }
                 return chain.proceed();
             });
@@ -138,6 +144,26 @@ public final class WeTypeModule extends XposedModule {
                 } catch (ReflectiveOperationException | RuntimeException | LinkageError failure) {
                     warn("Self-drawn key bridge did not match", failure);
                 }
+                try {
+                    ExpandedCandidates.install(this, loader);
+                } catch (ReflectiveOperationException | RuntimeException | LinkageError failure) {
+                    warn("Expanded candidate controls unavailable", failure);
+                }
+                try {
+                    CandidateGridBackdrop.install(this, loader);
+                } catch (ReflectiveOperationException | RuntimeException | LinkageError failure) {
+                    warn("Expanded candidate backdrop unavailable", failure);
+                }
+                try {
+                    Method computeInsets = ime.getClass().getDeclaredMethod("onComputeInsets", InputMethodService.Insets.class);
+                    intercept(computeInsets, chain -> {
+                        Object result = chain.proceed();
+                        if (owns(chain) && overlayDemoSearch) keepDemoBackdrop((InputMethodService.Insets) chain.getArg(0));
+                        return result;
+                    });
+                } catch (ReflectiveOperationException | RuntimeException | LinkageError failure) {
+                    warn("Demo search backdrop compatibility unavailable", failure);
+                }
                 compatible = true;
                 trace("WeType " + version + ", API=" + getApiVersion());
             }
@@ -150,6 +176,41 @@ public final class WeTypeModule extends XposedModule {
             compatible = false;
             warn("Keyboard material setup failed", failure);
         }
+    }
+
+    private void updateDemoSearch(EditorInfo editor) {
+        boolean overlay = false;
+        if (editor != null && "com.itos.coui.demo".equals(editor.packageName)
+                && (editor.imeOptions & EditorInfo.IME_MASK_ACTION) == EditorInfo.IME_ACTION_SEARCH) {
+            try {
+                String version = service.getPackageManager().getPackageInfo(editor.packageName, 0).versionName;
+                overlay = version != null && switch (version) {
+                    case "0.0.1-alpha16", "0.0.1-alpha17", "0.0.1-alpha18", "0.0.1-alpha20" -> true;
+                    default -> false;
+                };
+            } catch (PackageManager.NameNotFoundException ignored) {
+                // Leave layout insets alone when the installed Demo version is unknown.
+            }
+        }
+        if (overlayDemoSearch == overlay) return;
+        overlayDemoSearch = overlay;
+        View decor = imeDecor();
+        if (decor != null) decor.requestLayout();
+    }
+
+    private void keepDemoBackdrop(InputMethodService.Insets insets) {
+        if (!service.isInputViewShown() || service.isFullscreenMode()
+                || insets.touchableInsets != InputMethodService.Insets.TOUCHABLE_INSETS_VISIBLE) return;
+        View decor = imeDecor();
+        if (decor == null || decor.getHeight() <= insets.contentTopInsets) return;
+        // These Demo versions apply IME padding to the entire Scaffold, cutting away the blur source.
+        // Report overlay content while preserving the visible and touchable keyboard bounds.
+        insets.contentTopInsets = decor.getHeight();
+    }
+
+    private View imeDecor() {
+        Window window = service.getWindow() == null ? null : service.getWindow().getWindow();
+        return window == null ? null : window.peekDecorView();
     }
 
     private static View currentInputView(InputMethodService ime) {

@@ -6,6 +6,7 @@ import android.graphics.ColorFilter;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
+import android.graphics.drawable.InsetDrawable;
 import android.util.StateSet;
 import android.view.View;
 
@@ -22,14 +23,25 @@ final class ButtonBackground extends Drawable {
     private final Drawable original;
     private final float density;
     private final SelectionSpring choiceSelection;
+    final boolean liftMotion;
     private boolean choiceInitialized;
     private boolean choiceSelected;
     private int alpha = 255;
     private int digitFill = Color.WHITE;
 
+    static ButtonBackground find(Drawable background) {
+        while (background instanceof InsetDrawable inset) background = inset.getDrawable();
+        return background instanceof ButtonBackground button ? button : null;
+    }
+
     ButtonBackground(KeyboardStyle style, View view, Drawable original) {
+        this(style, view, original, true);
+    }
+
+    ButtonBackground(KeyboardStyle style, View view, Drawable original, boolean liftMotion) {
         this.style = style;
         this.original = original;
+        this.liftMotion = liftMotion;
         owner = new WeakReference<>(view);
         density = view.getResources().getDisplayMetrics().density;
         choiceSelection = view.getClass().getName().endsWith(".S10SettingItemView") && style.inChooser(view)

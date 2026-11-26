@@ -1,12 +1,14 @@
 package local.wetype.couiglass;
 
 import android.content.Context;
-import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Insets;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.InsetDrawable;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -20,6 +22,7 @@ import io.github.libxposed.api.XposedInterface;
 final class DrawHooks {
     private static final String KEYS = "com.tencent.wetype.plugin.hld.keyboard.selfdraw.";
     private static final String EMOJI_KEYBOARD = KEYS + "S11EmojiKeyboard";
+    private static final String SYMBOL_CONTENT = "com.tencent.wetype.plugin.hld.symbol.ImeSymbolKeyboardView";
     private static final String HANDWRITING_T9 = KEYS + "S27HandwriteT9Keyboard";
     private static final String HANDWRITING_T26 = KEYS + "S28HandwriteT26Keyboard";
     private final WeTypeModule module;
@@ -31,7 +34,6 @@ final class DrawHooks {
     private final Method fill;
     private final Method keyData;
     private final Method keyId;
-    private final Method shadow;
     private final Method pressedState;
     private final Method releasing;
     private final Method releaseAlpha;
@@ -43,11 +45,8 @@ final class DrawHooks {
     private final Method touchEvent;
     private final Class<?> button;
     private final ClassLoader loader;
-    private final ThreadLocal<BitmapPass> bitmapPass = new ThreadLocal<>();
     private boolean drewHardwareKey;
-    private boolean drewBitmapKey;
     private boolean faceFailed;
-    private boolean bitmapFailed;
     private boolean motionFailureReported;
 
     DrawHooks(WeTypeModule module, ClassLoader loader) throws ReflectiveOperationException {
@@ -65,7 +64,6 @@ final class DrawHooks {
         Class<?> data = Class.forName(KEYS + "bean.KeyData", false, loader);
         keyData = method(button, "O", data);
         keyId = method(data, "getId", String.class);
-        shadow = method(button, "Y", int.class);
         pressedState = method(button, "c0", String.class);
         releasing = method(button, "n0", boolean.class);
         releaseAlpha = method(button, "D", int.class);
@@ -83,6 +81,11 @@ final class DrawHooks {
         module.intercept(drawKey, this::drawKey);
         module.intercept(touchEvent, this::dispatchTouch);
         module.intercept(recordKey, this::recordKey);
+        try {
+            new AlphaKeyLabels(module, owner, keyData, keyId).install(loader);
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
+            module.warn("Using original letter labels", error);
+        }
         try {
             Method dispatch = method(View.class, "dispatchTouchEvent", boolean.class, MotionEvent.class);
             module.intercept(dispatch, chain -> chain.getThisObject() instanceof ViewGroup
@@ -138,19 +141,11 @@ final class DrawHooks {
         }
         try {
             Class<?> alpha = Class.forName(KEYS + "drawmethod.h", false, loader);
-            Field paint = alpha.getDeclaredField("i");
-            if (paint.getType() != Paint.class) throw new NoSuchFieldException("NormalAlphaDrawer paint");
-            paint.setAccessible(true);
-            Method drawBitmap = method(alpha, "i", Bitmap.class, Canvas.class, button);
-            Method drawBitmapToCanvas = method(alpha, "b", void.class, Canvas.class, button);
-            Method round = method(Canvas.class, "drawRoundRect", void.class, RectF.class,
-                    float.class, float.class, Paint.class);
-            module.intercept(round, this::drawBitmapFace);
-            module.intercept(drawBitmap, chain -> bitmapScope(chain, paint));
-            module.deoptimize(drawBitmap);
-            module.deoptimize(drawBitmapToCanvas);
+            AlphaSymbolKeys symbolKeys = new AlphaSymbolKeys(alpha);
+            module.intercept(method(alpha, "b", void.class, Canvas.class, button), symbolKeys::draw);
+            module.deoptimize(drawKey);
         } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
-            module.warn("Bitmap key hook unavailable", error);
+            module.warn("Using original symbol bottom row", error);
         }
     }
 
@@ -205,6 +200,16 @@ final class DrawHooks {
             }
             return chain.proceed();
         }
+        if (style != null && event.getActionMasked() == MotionEvent.ACTION_CANCEL
+                && view.getParent() != null && view.getParent() == style.layers().expandedCandidates().getWordList()) {
+            try {
+                // The native grid can take over a drag without cancelling the IME root's gesture.
+                IconButtonMotion.Press press = style.motion().sample(view);
+                if (press != null && press.getPointerId() >= 0) press.release(null);
+            } catch (RuntimeException | LinkageError error) {
+                resetMotion(style, error);
+            }
+        }
         Object handled = view.getBackground() instanceof SegmentedTabs tabs
                 ? tabs.dispatch(chain, event) : chain.proceed();
         if (style != null) {
@@ -224,19 +229,24 @@ final class DrawHooks {
         if (style.layers().ownsPopup(view)) {
             return style.layers().drawPopup(chain);
         }
-        boolean logo = view instanceof ImageView image && image.getDrawable() instanceof ToolbarLogo;
-        Object background = view.getBackground();
-        if (!logo && !(background instanceof ButtonBackground) && !(background instanceof SegmentedTabs)) {
-            return chain.proceed();
-        }
         IconButtonMotion.Press motion = style.motion().sample(view);
         if (motion == null) return chain.proceed();
+        boolean logo = view instanceof ImageView image && image.getDrawable() instanceof ToolbarLogo;
+        Drawable background = view.getBackground();
+        ButtonBackground buttonFace = ButtonBackground.find(background);
+        if (!logo && buttonFace == null && !(background instanceof SegmentedTabs)) return chain.proceed();
         RectF face = background instanceof SegmentedTabs tabs ? new RectF(tabs.touchBounds())
                 : new RectF(0f, 0f, view.getWidth(), view.getHeight());
+        if (buttonFace != null && background instanceof InsetDrawable inset) {
+            Insets padding = inset.getOpticalInsets();
+            face.set(padding.left, padding.top, face.right - padding.right, face.bottom - padding.bottom);
+        }
         float density = view.getResources().getDisplayMetrics().density;
         float radius = background instanceof SegmentedTabs tabs ? tabs.getOutlineRadius()
                 : KeySurface.radius(face.width(), face.height(), density);
-        if (style.layers().lift(view, view, face, radius, motion, chain)) return null;
+        if ((buttonFace == null || buttonFace.liftMotion)
+                && style.layers().lift(view, view, face, radius, motion, chain)) return null;
+        if (face.isEmpty()) return chain.proceed();
         Canvas canvas = (Canvas) chain.getArg(0);
         int saved = canvas.save();
         try {
@@ -275,31 +285,31 @@ final class DrawHooks {
         if (style == null || faceFailed) return chain.proceed();
         try {
             View view = (View) owner.invoke(chain.getThisObject());
-            if (style.draws(view)) {
-                Canvas canvas = (Canvas) chain.getArg(0);
-                Object key = chain.getArg(1);
-                Rect rect = (Rect) bounds.invoke(key);
-                int color = visibleFill(view, key);
-                boolean pressed = !handwritingDecoration(view, key) && "press".equals(pressedState.invoke(key));
-                if (rect != null && Color.alpha(color) != 0) {
-                    RectF face = keyFace(view, key, rect);
-                    float density = view.getResources().getDisplayMetrics().density;
-                    IconButtonMotion.Press motion = style.motion().sample(key);
-                    if (style.material().draw(canvas, face.left, face.top, face.right, face.bottom,
-                            density, Color.alpha(color), pressed, CouiPalette.darkKey(style.dark(), color), motion)) {
-                        if (!drewHardwareKey) {
-                            drewHardwareKey = true;
-                            module.trace("Self-drawn key material applied");
-                        }
-                        return null;
-                    }
+            Object key = chain.getArg(1);
+            if (style.draws(view) && drawKeyMaterial(style, view, key, (Rect) bounds.invoke(key),
+                    (Canvas) chain.getArg(0))) {
+                if (!drewHardwareKey) {
+                    drewHardwareKey = true;
+                    module.trace("Self-drawn key material applied");
                 }
+                return null;
             }
         } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
             faceFailed = true;
             module.warn("Using original self-drawn keys", error);
         }
         return chain.proceed();
+    }
+
+    private boolean drawKeyMaterial(KeyboardStyle style, View view, Object key, Rect rect, Canvas canvas)
+            throws ReflectiveOperationException {
+        int color = visibleFill(view, key);
+        if (rect == null || Color.alpha(color) == 0) return false;
+        RectF face = keyFace(view, key, rect);
+        float density = view.getResources().getDisplayMetrics().density;
+        boolean pressed = !handwritingDecoration(view, key) && "press".equals(pressedState.invoke(key));
+        return style.material().draw(canvas, face.left, face.top, face.right, face.bottom, density,
+                Color.alpha(color), pressed, CouiPalette.darkKey(style.dark(), color), style.motion().sample(key));
     }
 
     private Object drawRelease(XposedInterface.Chain chain) throws Throwable {
@@ -358,66 +368,6 @@ final class DrawHooks {
         return keyFace;
     }
 
-    private Object bitmapScope(XposedInterface.Chain chain, Field paint) throws Throwable {
-        KeyboardStyle style = module.style();
-        if (style == null || bitmapFailed) return chain.proceed();
-        BitmapPass pass = null;
-        try {
-            View view = (View) owner.invoke(chain.getThisObject());
-            if (style.draws(view)) {
-                Object key = chain.getArg(1);
-                int color = (int) fill.invoke(key);
-                Rect rect = (Rect) bounds.invoke(key);
-                if (Color.alpha(color) != 0 && rect != null && rect.width() >= 2 && rect.height() >= 2) {
-                    pass = new BitmapPass(style, (Paint) paint.get(chain.getThisObject()), color,
-                            view.getResources().getDisplayMetrics().density,
-                            (int) shadow.invoke(key) == 0 ? 0 : 1,
-                            !handwritingDecoration(view, key) && "press".equals(pressedState.invoke(key)));
-                }
-            }
-        } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
-            bitmapFailed = true;
-            module.warn("Using original bitmap keys", error);
-        }
-        if (pass == null) return chain.proceed();
-        BitmapPass previous = bitmapPass.get();
-        bitmapPass.set(pass);
-        try {
-            return chain.proceed();
-        } finally {
-            if (previous == null) bitmapPass.remove();
-            else bitmapPass.set(previous);
-        }
-    }
-
-    private Object drawBitmapFace(XposedInterface.Chain chain) throws Throwable {
-        BitmapPass pass = bitmapPass.get();
-        if (pass == null || bitmapFailed || chain.getArg(3) != pass.paint) return chain.proceed();
-        int shape = pass.nextShape++;
-        if (shape < pass.fillIndex || pass.replaced) return null;
-        if (shape == pass.fillIndex && pass.paint.getStyle() == Paint.Style.FILL
-                && pass.paint.getColor() == pass.fillColor) {
-            Canvas canvas = (Canvas) chain.getThisObject();
-            RectF r = (RectF) chain.getArg(0);
-            try {
-                pass.replaced = pass.style.material().draw(canvas, r.left, r.top, r.right, r.bottom,
-                        pass.density, Color.alpha(pass.fillColor), pass.pressed,
-                        CouiPalette.darkKey(pass.style.dark(), pass.fillColor), null);
-                if (pass.replaced) {
-                    if (!drewBitmapKey) {
-                        drewBitmapKey = true;
-                        module.trace("Bitmap key material applied");
-                    }
-                    return null;
-                }
-            } catch (RuntimeException | LinkageError error) {
-                bitmapFailed = true;
-                module.warn("Unable to paint a bitmap key", error);
-            }
-        }
-        return chain.proceed();
-    }
-
     private void installCandidateHighlight() throws ReflectiveOperationException {
         Class<?> cell = Class.forName("com.tencent.wetype.plugin.hld.candidate.selfdraw.selfview.e", false, loader);
         Method color = method(cell, "k", int.class);
@@ -447,23 +397,81 @@ final class DrawHooks {
         return method;
     }
 
-    private static final class BitmapPass {
-        final KeyboardStyle style;
-        final Paint paint;
-        final int fillColor;
-        final float density;
-        final int fillIndex;
-        final boolean pressed;
-        int nextShape;
-        boolean replaced;
+    private final class AlphaSymbolKeys {
+        private final Field fade;
+        private final Field textPaint;
+        private final Method upperCase;
+        private final Method contentVisible;
+        private final Method mainText;
+        private final Method prepareText;
+        private boolean failed;
+        private boolean reported;
 
-        BitmapPass(KeyboardStyle style, Paint paint, int fillColor, float density, int fillIndex, boolean pressed) {
-            this.style = style;
-            this.paint = paint;
-            this.fillColor = fillColor;
-            this.density = density;
-            this.fillIndex = fillIndex;
-            this.pressed = pressed;
+        AlphaSymbolKeys(Class<?> drawer) throws ReflectiveOperationException {
+            fade = field(drawer, "l", int.class);
+            textPaint = field(drawer, "j", Paint.class);
+            upperCase = method(owner.getReturnType(), "X", boolean.class);
+            contentVisible = method(button, "l0", boolean.class);
+            mainText = method(button, "R", String.class);
+            prepareText = method(drawer, "k", void.class, button, boolean.class);
         }
+
+        Object draw(XposedInterface.Chain chain) throws Throwable {
+            KeyboardStyle style = module.style();
+            if (style == null || failed) return chain.proceed();
+            try {
+                Object drawer = chain.getThisObject();
+                View view = (View) owner.invoke(drawer);
+                if (SYMBOL_CONTENT.equals(view.getClass().getName()) && style.draws(view)
+                        && paint(style, view, drawer, chain.getArg(1), (Canvas) chain.getArg(0))) return null;
+            } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
+                failed = true;
+                module.warn("Unable to draw the symbol bottom row", error);
+            }
+            return chain.proceed();
+        }
+
+        private boolean paint(KeyboardStyle style, View view, Object drawer, Object key, Canvas canvas)
+                throws ReflectiveOperationException {
+            // NormalAlphaDrawer has already calculated the fade against S5's fixed action keys.
+            int alpha = fade.getInt(drawer);
+            if (alpha == 0) return true;
+            Rect rect = (Rect) bounds.invoke(key);
+            if (rect == null || rect.isEmpty()) return false;
+            String text = null;
+            Paint label = null;
+            if ((boolean) contentVisible.invoke(key)) {
+                prepareText.invoke(drawer, key, upperCase.invoke(view));
+                text = (String) mainText.invoke(key);
+                label = (Paint) textPaint.get(drawer);
+            }
+
+            int saved = alpha == 255 ? canvas.save()
+                    : canvas.saveLayerAlpha(rect.left, rect.top, rect.right, rect.bottom, alpha);
+            try {
+                if (!drawKeyMaterial(style, view, key, rect, canvas)) return false;
+                if (text != null && label != null) {
+                    // Keep the original bitmap's label baseline and clipping in canvas coordinates.
+                    canvas.clipRect(rect);
+                    Paint.FontMetrics metrics = label.getFontMetrics();
+                    canvas.drawText(text, rect.exactCenterX(),
+                            rect.exactCenterY() + metrics.leading - (metrics.ascent + metrics.descent) / 2f, label);
+                }
+            } finally {
+                canvas.restoreToCount(saved);
+            }
+            if (!reported) {
+                reported = true;
+                module.trace("Symbol bottom row material applied");
+            }
+            return true;
+        }
+    }
+
+    private static Field field(Class<?> owner, String name, Class<?> type) throws ReflectiveOperationException {
+        Field field = owner.getDeclaredField(name);
+        if (field.getType() != type) throw new NoSuchFieldException(owner.getName() + "." + name);
+        field.setAccessible(true);
+        return field;
     }
 }

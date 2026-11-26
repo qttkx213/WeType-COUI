@@ -4,8 +4,8 @@ import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
 import android.animation.ValueAnimator;
 import android.graphics.Bitmap;
-import android.graphics.BlendMode;
 import android.graphics.Canvas;
+import android.graphics.HardwareRenderer;
 import android.graphics.Paint;
 import android.graphics.RecordingCanvas;
 import android.graphics.RenderNode;
@@ -20,8 +20,10 @@ import android.view.animation.PathInterpolator;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -29,8 +31,13 @@ import io.github.libxposed.api.XposedInterface;
 
 /** Animates keyboard pages above the IME window's live blur. */
 final class PageMotion {
+    private static final int TOOLBAR_LOGO = 0x7f090329;
+    private static final int TOOLBAR_LIST = 0x7f0901c2;
+    private static final int TOOLBAR_BACK = 0x7f0904e7;
+    private static final int GRID_HANDWRITE = 0x7f090480;
+
     enum Page {
-        KEYBOARD, TOOLS, OTHER;
+        KEYBOARD, TOOLS, CLIPBOARD, CLIPBOARD_CLEAN_RECORD, CORRECTION, HANDWRITE_TOOL, TOOL, OTHER;
 
         static Page named(String name) {
             return switch (name) {
@@ -38,36 +45,95 @@ final class PageMotion {
                         "DoublePinQwerty", "Stroke", "HandWrite", "HandWriteFullScreen", "EnglishNumberSymbols",
                         "ChineseNumberSymbols", "Symbols", "Number", "PureNumber" -> KEYBOARD;
                 case "Setting" -> TOOLS;
+                case "CustomPhraseAndClipboard" -> CLIPBOARD;
+                case "ClipboardCleanRecord" -> CLIPBOARD_CLEAN_RECORD;
+                case "Correction" -> CORRECTION;
+                case "HandwriteFindWordT9", "HandwriteFindWordT26" -> HANDWRITE_TOOL;
+                case "KeyboardChoose", "Emoji", "Inspiration", "RequestAI", "ImagePreview", "PC", "Debug" -> TOOL;
                 default -> OTHER;
+            };
+        }
+
+        boolean isTool() {
+            return this == TOOLS || this == CLIPBOARD || this == CORRECTION || this == HANDWRITE_TOOL || this == TOOL;
+        }
+    }
+
+    enum Source { OTHER, TOOLBAR, BACK }
+
+    enum Direction {
+        NONE, OPEN, CLOSE;
+
+        float verticalOffset(float travel, float fraction) {
+            return switch (this) {
+                case OPEN -> -travel * (1f - fraction);
+                case CLOSE -> -travel * fraction;
+                case NONE -> 0f;
             };
         }
     }
 
-    static boolean animateTools(Page from, Page to, boolean inlinePanel) {
-        return !inlinePanel && (from == Page.KEYBOARD && to == Page.TOOLS || from == Page.TOOLS && to == Page.KEYBOARD);
+    static final class ToolNavigation {
+        private final List<Integer> path = new ArrayList<>();
+        private boolean candidateBack;
+
+        void onCandidateBack() { candidateBack = !path.isEmpty(); }
+
+        Direction change(int fromId, Page from, int toId, Page to, Source source) {
+            // The correction page handles the header's back click off the main thread.
+            if (from == Page.CORRECTION && candidateBack && source == Source.OTHER) source = Source.BACK;
+            candidateBack = false;
+            if (fromId == toId || (from == Page.CLIPBOARD && to == Page.CLIPBOARD_CLEAN_RECORD)
+                    || (from == Page.CLIPBOARD_CLEAN_RECORD && to == Page.CLIPBOARD)) return Direction.NONE;
+            if (!path.isEmpty() && path.get(path.size() - 1) != fromId) clear();
+
+            int parent = path.lastIndexOf(toId);
+            if (parent >= 0 && (source == Source.BACK || source == Source.TOOLBAR && to.isTool())) {
+                if (parent == 0) clear();
+                else path.subList(parent + 1, path.size()).clear();
+                return Direction.CLOSE;
+            }
+            if (source == Source.TOOLBAR && to.isTool()) {
+                if (path.isEmpty()) path.add(fromId);
+                path.add(toId);
+                return Direction.OPEN;
+            }
+            // Some host back buttons skip the tools grid and return to the typing layout.
+            boolean returning = source == Source.BACK && !path.isEmpty() && to == Page.KEYBOARD;
+            clear();
+            return returning ? Direction.CLOSE : Direction.NONE;
+        }
+
+        void clear() {
+            path.clear();
+            candidateBack = false;
+        }
     }
 
     private final KeyboardStyle style;
     private final Paint sourcePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
-    private final Paint add = new Paint();
-    private final RenderNode incoming = new RenderNode("WeType incoming keyboard page");
+    private final RenderNode captureNode = new RenderNode("WeType outgoing keyboard page");
+    private final ToolNavigation navigation = new ToolNavigation();
     // ColorOS 17 push and pop translation curves from suqi8/coui's COUIPageTransition.
     private final Interpolator openEnter = new PathInterpolator(.3f, .1f, .3f, 1f);
-    private final Interpolator openExit = new PathInterpolator(.3f, .15f, .3f, 1f);
-    private final Interpolator closeEnter = new PathInterpolator(.3f, .26f, .4f, 1f);
     private final Interpolator closeExit = new PathInterpolator(.25f, .1f, .3f, 1f);
+    private Source source = Source.OTHER;
+    private Direction direction = Direction.NONE;
     private Bitmap outgoing;
+    private Bitmap handwriteGridFrame;
     private ValueAnimator animation;
     private float progress;
-    private boolean returning;
     private boolean switching;
+    private boolean capturing;
+    private Method hardwareSnapshot;
     private boolean suppressSideSlide;
     private View target;
+    private String expectedOverlay;
+    private String inlineTool;
     private long waitUntil;
 
     PageMotion(KeyboardStyle style) {
         this.style = style;
-        add.setBlendMode(BlendMode.PLUS);
     }
 
     static void install(WeTypeModule module, ClassLoader loader) throws ReflectiveOperationException {
@@ -89,6 +155,7 @@ final class PageMotion {
         args[9] = args[10] = callback;
         Method switchPage = DrawHooks.method(model, "L3", void.class, args);
         Method drawChildren = DrawHooks.method(ViewGroup.class, "dispatchDraw", void.class, Canvas.class);
+        Class<?> toolsGrid = Class.forName(prefix + "keyboard.S10SettingsKeyboard", false, loader);
         Map<Class<?>, Field> bundles = new ConcurrentHashMap<>();
 
         module.intercept(switchPage, chain -> {
@@ -103,20 +170,32 @@ final class PageMotion {
             if (pages.switching) return chain.proceed(arguments);
 
             Object instance = chain.getThisObject();
-            Page from = pageTypes.get((int) previous.invoke(instance));
-            Page to = pageTypes.get((int) current.invoke(instance));
-            boolean inlinePanel = to == Page.TOOLS && requestsInlinePanel(chain.getArg(9), bundles)
-                    || from == Page.TOOLS && style.inlinePanelVisible();
-            Bitmap frame = animateTools(from, to, inlinePanel) ? capture(module, pages, root, drawChildren) : null;
-            if (frame == null) pages.clear();
+            int fromId = (int) previous.invoke(instance);
+            int toId = (int) current.invoke(instance);
+            Page from = pageTypes.getOrDefault(fromId, Page.OTHER);
+            Page to = pageTypes.getOrDefault(toId, Page.OTHER);
+            Direction direction = pages.navigation.change(fromId, from, toId, to, pages.source);
+            int scrollIndex = to == Page.TOOLS && pages.source == Source.TOOLBAR
+                    ? requestedScrollIndex(chain.getArg(9), bundles) : -1;
+            String inline = inlinePanel(scrollIndex);
+            // Index 1 opens the guide's chooser after a delay. Show the grid while it waits.
+            String expected = scrollIndex == 1 ? null : inline;
+            if (expected != null && !style.overlayVisible(expected)) direction = Direction.OPEN;
+            pages.inlineTool = inline;
 
             pages.switching = true;
             pages.suppressSideSlide = (boolean) arguments[1] || (boolean) arguments[2];
             try {
+                Bitmap frame = null;
+                if (direction != Direction.NONE) {
+                    frame = direction == Direction.OPEN && to == Page.HANDWRITE_TOOL ? pages.handwriteGridFrame : null;
+                    if (frame == null) frame = capture(module, pages, root, drawChildren);
+                }
+                if (frame == null) pages.clearAnimation();
                 Object result = chain.proceed(arguments);
                 if (frame != null && root == style.animationRoot()) {
                     View view = (View) currentView.invoke(instance);
-                    pages.start(root, frame, from == Page.TOOLS, view);
+                    pages.start(root, frame, direction, view, expected);
                 }
                 return result;
             } finally {
@@ -125,18 +204,86 @@ final class PageMotion {
                 style.refresh();
             }
         });
+        // N.m3 runs these main-thread keyboard switches before the click handler returns.
+        Class<?> candidate = Class.forName(prefix + "candidate.ImeCandidateView", false, loader);
+        module.intercept(DrawHooks.method(candidate, "onClick", void.class, View.class), chain -> {
+            View view = (View) chain.getArg(0);
+            if (view == null) return chain.proceed();
+            return switch (view.getId()) {
+                case TOOLBAR_LOGO -> withSource(module, chain, Source.TOOLBAR);
+                case TOOLBAR_BACK -> {
+                    KeyboardStyle style = module.style();
+                    if (style != null) style.pages().navigation.onCandidateBack();
+                    yield withSource(module, chain, Source.BACK);
+                }
+                default -> chain.proceed();
+            };
+        });
+        Class<?> toolbar = Class.forName(prefix + "toolbar.m", false, loader);
+        Class<?> continuation = Class.forName("kotlin.coroutines.d", false, loader);
+        module.intercept(DrawHooks.method(toolbar, "I", Object.class, View.class, continuation), chain ->
+                insideToolbar((View) chain.getArg(0)) ? withSource(module, chain, Source.TOOLBAR) : chain.proceed());
+        module.intercept(DrawHooks.method(toolsGrid, "Q0", void.class, int.class, View.class), chain -> {
+            KeyboardStyle style = module.style();
+            View root = style == null ? null : style.animationRoot();
+            if (root == null || (int) chain.getArg(0) != GRID_HANDWRITE) {
+                return withSource(module, chain, Source.TOOLBAR);
+            }
+            // The grid closes before the host opens the T9 or T26 finding-words layout.
+            PageMotion pages = style.pages();
+            pages.handwriteGridFrame = capture(module, pages, root, drawChildren);
+            try {
+                return withSource(module, chain, Source.TOOLBAR);
+            } finally {
+                pages.handwriteGridFrame = null;
+            }
+        });
+        Class<?> clipboardPreview = Class.forName(prefix + "candidate.t", false, loader);
+        // u(false) opens the clipboard panel from its icon. u(true) opens the preview's separate arrow action.
+        module.intercept(DrawHooks.method(clipboardPreview, "u", void.class, boolean.class), chain ->
+                (boolean) chain.getArg(0) ? chain.proceed() : withSource(module, chain, Source.TOOLBAR));
+        // Clipboard's header back uses Q2. Its internal actions can also call the generic X switch.
+        module.intercept(DrawHooks.method(model, "Q2", void.class, boolean.class),
+                chain -> withSource(module, chain, Source.BACK));
+        module.intercept(DrawHooks.method(model, "X", void.class, boolean.class), chain ->
+                pageTypes.get((int) current.invoke(chain.getThisObject())) == Page.CLIPBOARD
+                        ? chain.proceed() : withSource(module, chain, Source.BACK));
+
         module.intercept(DrawHooks.method(View.class, "setVisibility", void.class, int.class), chain -> {
             View page = (View) chain.getThisObject();
+            String name = page.getClass().getName();
             boolean visible = (int) chain.getArg(0) == View.VISIBLE;
-            if (!KeyboardStyle.isInlinePanel(page.getClass().getName())
+            if (!KeyboardStyle.isInlinePanel(name)
                     || visible == (page.getVisibility() == View.VISIBLE)) return chain.proceed();
             KeyboardStyle style = module.style();
-            if (style == null || style.animationRoot() == null || !style.draws(page)
-                    || !(page.getParent() instanceof View parent) || !style.visible(parent)) return chain.proceed();
-            Object result = chain.proceed();
-            if (!style.pages().switching) style.pages().clear();
-            style.refresh();
-            return result;
+            View root = style == null ? null : style.animationRoot();
+            if (root == null || !insideGrid(page, toolsGrid) || !(page.getParent() instanceof View parent)
+                    || !style.visible(parent)) return chain.proceed();
+
+            PageMotion pages = style.pages();
+            if (pages.switching) return chain.proceed();
+            if (visible && name.equals(pages.expectedOverlay)) {
+                Object result = chain.proceed();
+                style.refresh();
+                return result;
+            }
+            Direction direction = inlineMotion(visible, pages.source == Source.TOOLBAR, name.equals(pages.inlineTool));
+            if (visible || direction == Direction.CLOSE) pages.inlineTool = direction == Direction.OPEN ? name : null;
+
+            pages.switching = true;
+            try {
+                Bitmap frame = direction == Direction.NONE ? null : capture(module, pages, root, drawChildren);
+                Object result = chain.proceed();
+                if (frame != null && root == style.animationRoot()) {
+                    pages.start(root, frame, direction, visible ? page : parent, null);
+                } else if (visible || direction == Direction.CLOSE) {
+                    pages.clearAnimation();
+                }
+                return result;
+            } finally {
+                pages.switching = false;
+                style.refresh();
+            }
         });
         try {
             Class<?> settings = Class.forName(prefix + "utils.i1", false, loader);
@@ -152,14 +299,42 @@ final class PageMotion {
             module.warn("Using the original side panel exit", error);
         }
         try {
-            disableInlineZoom(module, loader, prefix);
+            disableInlineZoom(module, loader, prefix, toolsGrid);
         } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
             module.warn("Using the original tool subpage zoom", error);
         }
         module.trace("Keyboard page transitions ready");
     }
 
-    private static void disableInlineZoom(WeTypeModule module, ClassLoader loader, String prefix)
+    private static Object withSource(WeTypeModule module, XposedInterface.Chain chain, Source source) throws Throwable {
+        KeyboardStyle style = module.style();
+        if (style == null || Looper.myLooper() != Looper.getMainLooper()) return chain.proceed();
+        PageMotion pages = style.pages();
+        Source previous = pages.source;
+        if (previous == Source.TOOLBAR && source == Source.BACK) return chain.proceed();
+        pages.source = source;
+        try {
+            return chain.proceed();
+        } finally {
+            pages.source = previous;
+        }
+    }
+
+    private static boolean insideToolbar(View view) {
+        for (; view != null; view = view.getParent() instanceof View parent ? parent : null) {
+            if (view.getId() == TOOLBAR_LIST) return true;
+        }
+        return false;
+    }
+
+    private static boolean insideGrid(View view, Class<?> toolsGrid) {
+        for (; view != null; view = view.getParent() instanceof View parent ? parent : null) {
+            if (toolsGrid.isInstance(view)) return true;
+        }
+        return false;
+    }
+
+    private static void disableInlineZoom(WeTypeModule module, ClassLoader loader, String prefix, Class<?> toolsGrid)
             throws ReflectiveOperationException {
         Class<?> zoom = Class.forName(prefix + "utils.K0", false, loader);
         Class<?> callback = Class.forName(prefix + "utils.K0$b", false, loader);
@@ -169,11 +344,17 @@ final class PageMotion {
         XposedInterface.Hooker withoutZoom = chain -> {
             KeyboardStyle style = module.style();
             View background = (View) chain.getArg(0);
-            if (!(boolean) chain.getArg(3) || style == null || style.animationRoot() == null
-                    || !style.draws(background)) return chain.proceed();
+            if (style == null || style.animationRoot() == null || !style.draws(background)) return chain.proceed();
             for (View view = background; view != null;
                     view = view.getParent() instanceof View parent ? parent : null) {
                 if (KeyboardStyle.isInlinePanel(view.getClass().getName())) {
+                    PageMotion pages = style.pages();
+                    // The grid's visibility callback can run after the card click returns.
+                    if (chain.getExecutable().equals(enter) && pages.source == Source.TOOLBAR && !pages.switching
+                            && insideGrid(view, toolsGrid)) {
+                        pages.inlineTool = view.getClass().getName();
+                    }
+                    if (!(boolean) chain.getArg(3)) return chain.proceed();
                     Object[] arguments = chain.getArgs().toArray();
                     arguments[3] = false;
                     return chain.proceed(arguments);
@@ -185,8 +366,8 @@ final class PageMotion {
         module.intercept(exit, withoutZoom);
     }
 
-    private static boolean requestsInlinePanel(Object callback, Map<Class<?>, Field> cache) throws IllegalAccessException {
-        if (callback == null) return false;
+    private static int requestedScrollIndex(Object callback, Map<Class<?>, Field> cache) throws IllegalAccessException {
+        if (callback == null) return -1;
         Field field = cache.computeIfAbsent(callback.getClass(), type -> {
             for (Field candidate : type.getDeclaredFields()) {
                 if (candidate.getType() == Bundle.class) {
@@ -197,12 +378,26 @@ final class PageMotion {
             return null;
         });
         Bundle request = field == null ? null : (Bundle) field.get(callback);
-        int target = request == null ? -1 : request.getInt("target_scroll_index", -1);
-        return target == 3 || target == 4 || target == 5 || target == 7;
+        return request == null ? -1 : request.getInt("target_scroll_index", -1);
+    }
+
+    static String inlinePanel(int scrollIndex) {
+        return switch (scrollIndex) {
+            case 1, 5 -> KeyboardStyle.INLINE_CHOOSER;
+            case 3 -> KeyboardStyle.INLINE_PLUS;
+            case 4 -> KeyboardStyle.INLINE_TOOLBAR;
+            case 7 -> KeyboardStyle.INLINE_OFFLINE_VOICE;
+            default -> null;
+        };
+    }
+
+    static Direction inlineMotion(boolean visible, boolean clickedToolbar, boolean toolbarPanel) {
+        if (visible) return clickedToolbar || toolbarPanel ? Direction.OPEN : Direction.NONE;
+        return toolbarPanel ? Direction.CLOSE : Direction.NONE;
     }
 
     private static Bitmap capture(WeTypeModule module, PageMotion pages, View root, Method drawChildren) {
-        if (!ValueAnimator.areAnimatorsEnabled()) return null;
+        if (Looper.myLooper() != Looper.getMainLooper() || !ValueAnimator.areAnimatorsEnabled()) return null;
         try {
             return pages.snapshot(root, drawChildren);
         } catch (ReflectiveOperationException | RuntimeException error) {
@@ -212,35 +407,52 @@ final class PageMotion {
     }
 
     private Bitmap snapshot(View root, Method drawChildren) throws ReflectiveOperationException {
-        // Start reversals from the displayed composition. Ignore the window backdrop in both passes.
+        // Reuse a waiting frame on reversal. The root's background stays live in the IME window.
         if (outgoing != null && animation == null && outgoing.getWidth() == root.getWidth()) return outgoing;
-        Bitmap bitmap = Bitmap.createBitmap(root.getWidth(), root.getHeight(), Bitmap.Config.ARGB_8888);
-        Canvas canvas = new Canvas(bitmap);
-        if (outgoing != null && outgoing.getWidth() == root.getWidth()) {
-            drawFrame(canvas, root, live -> drawChildren.invoke(root, live));
-        } else {
-            drawChildren.invoke(root, canvas);
+        if (hardwareSnapshot == null) {
+            hardwareSnapshot = HardwareRenderer.class.getMethod("createHardwareBitmap",
+                    RenderNode.class, int.class, int.class);
         }
-        return bitmap;
+        int width = root.getWidth();
+        int height = root.getHeight();
+        captureNode.setPosition(0, 0, width, height);
+        try {
+            RecordingCanvas canvas = captureNode.beginRecording();
+            capturing = true;
+            try {
+                drawChildren.invoke(root, canvas);
+            } finally {
+                capturing = false;
+                captureNode.endRecording();
+            }
+            // Freeze the GPU-rendered material before the host recycles its child views.
+            Bitmap frame = (Bitmap) hardwareSnapshot.invoke(null, captureNode, width, height);
+            if (frame != null) frame.setDensity(Bitmap.DENSITY_NONE);
+            return frame;
+        } finally {
+            captureNode.discardDisplayList();
+        }
     }
 
-    private void start(View root, Bitmap frame, boolean returning, View target) {
-        clear();
+    private void start(View root, Bitmap frame, Direction direction, View target, String expectedOverlay) {
+        clearAnimation();
         outgoing = frame;
-        this.returning = returning;
+        this.direction = direction;
         this.target = target;
+        this.expectedOverlay = expectedOverlay;
         waitUntil = SystemClock.uptimeMillis() + 220L;
         progress = 0f;
         root.invalidate();
     }
 
     private boolean targetMounted() {
-        return target == null || target.isLaidOut() && target.getWidth() > 0 && target.getHeight() > 0
-                && style.visible(target);
+        return (target == null || target.isLaidOut() && target.getWidth() > 0 && target.getHeight() > 0
+                && style.visible(target)) && (expectedOverlay == null || style.overlayVisible(expectedOverlay));
     }
 
     private void animate(View root) {
         target = null;
+        expectedOverlay = null;
         ValueAnimator next = ValueAnimator.ofFloat(0f, 1f);
         animation = next;
         next.setDuration(240);
@@ -254,7 +466,6 @@ final class PageMotion {
                 if (animation == ended) {
                     animation = null;
                     outgoing = null;
-                    incoming.discardDisplayList();
                     root.invalidate();
                 }
             }
@@ -264,8 +475,12 @@ final class PageMotion {
 
     Object draw(XposedInterface.Chain chain, View root, Canvas canvas) throws Throwable {
         if (!canvas.isHardwareAccelerated()) return chain.proceed();
+        if (capturing) {
+            return outgoing != null && animation != null && outgoing.getWidth() == root.getWidth()
+                    ? drawFrame(chain, root, canvas) : style.layers().draw(chain, root, canvas);
+        }
         if (outgoing != null && (outgoing.getWidth() != root.getWidth() || !ValueAnimator.areAnimatorsEnabled())) {
-            clear();
+            clearAnimation();
         }
         if (outgoing != null && animation == null) {
             boolean timedOut = SystemClock.uptimeMillis() >= waitUntil;
@@ -276,63 +491,55 @@ final class PageMotion {
                 root.postInvalidateOnAnimation();
                 return null;
             } else {
-                clear();
+                clearAnimation();
             }
         }
         if (outgoing == null) return style.layers().draw(chain, root, canvas);
 
-        incoming.setPosition(0, 0, root.getWidth(), root.getHeight());
-        RecordingCanvas content = incoming.beginRecording();
-        try {
-            style.layers().draw(chain, root, content);
-        } finally {
-            incoming.endRecording();
-        }
-        drawFrame(canvas, root, canvasToDraw -> canvasToDraw.drawRenderNode(incoming));
-        return null;
+        return drawFrame(chain, root, canvas);
     }
 
-    private void drawFrame(Canvas canvas, View root, DrawPage live) throws ReflectiveOperationException {
+    private Object drawFrame(XposedInterface.Chain chain, View root, Canvas canvas) throws Throwable {
         int width = root.getWidth();
         int height = root.getHeight();
-        float reveal = (returning ? closeEnter : openEnter).getInterpolation(progress);
-        float exit = (returning ? closeExit : openExit).getInterpolation(progress);
-        float density = root.getResources().getDisplayMetrics().density;
-        float travel = Math.min(24f * density, width * .12f);
-        float direction = root.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL ? -1f : 1f;
-        int enterOffset = Math.round(direction * travel * (returning ? -.3f : 1f) * (1f - reveal));
-        int exitOffset = Math.round(direction * travel * (returning ? 1f : -.3f) * exit);
-        int targetAlpha = Math.round(reveal * 255f);
-        int blend = canvas.saveLayer(0f, 0f, width, height, null);
+        boolean returning = direction == Direction.CLOSE;
+        // Fade the pages in sequence so translucent key faces do not overlap.
+        float handoff = returning ? .65f : .35f;
+        float travel = Math.min(24f * root.getResources().getDisplayMetrics().density, height * .12f);
+        if (progress < handoff) {
+            float fraction = progress / handoff;
+            float offset = returning ? direction.verticalOffset(travel, closeExit.getInterpolation(fraction)) : 0f;
+            sourcePaint.setAlpha(Math.round((1f - fraction * fraction) * 255f));
+            int clip = canvas.save();
+            canvas.clipRect(0, 0, width, height);
+            canvas.drawBitmap(outgoing, 0f, height - outgoing.getHeight() + Math.round(offset), sourcePaint);
+            canvas.restoreToCount(clip);
+            return null;
+        }
+        float fraction = (progress - handoff) / (1f - handoff);
+        int alpha = Math.round(fraction * (2f - fraction) * 255f);
+        if (alpha <= 0) return null;
+        int layer = canvas.saveLayerAlpha(0f, 0f, width, height, alpha);
         try {
             canvas.clipRect(0, 0, width, height);
-            // Complementary weights preserve the amount of glass over the shared blurred window.
-            int saved = canvas.save();
-            canvas.translate(exitOffset, 0f);
-            sourcePaint.setAlpha(255 - targetAlpha);
-            canvas.drawBitmap(outgoing, 0f, height - outgoing.getHeight(), sourcePaint);
-            canvas.restoreToCount(saved);
-            if (targetAlpha != 0) {
-                add.setAlpha(targetAlpha);
-                int layer = canvas.saveLayer(0f, 0f, width, height, add);
-                try {
-                    canvas.translate(enterOffset, 0f);
-                    live.draw(canvas);
-                } finally {
-                    canvas.restoreToCount(layer);
-                }
+            if (!returning) {
+                float offset = direction.verticalOffset(travel, openEnter.getInterpolation(fraction));
+                canvas.translate(0f, Math.round(offset));
             }
+            return style.layers().draw(chain, root, canvas);
         } finally {
-            canvas.restoreToCount(blend);
+            canvas.restoreToCount(layer);
         }
-    }
-
-    @FunctionalInterface
-    private interface DrawPage {
-        void draw(Canvas canvas) throws ReflectiveOperationException;
     }
 
     void clear() {
+        navigation.clear();
+        inlineTool = null;
+        handwriteGridFrame = null;
+        clearAnimation();
+    }
+
+    private void clearAnimation() {
         if (animation != null) {
             animation.removeAllListeners();
             animation.removeAllUpdateListeners();
@@ -340,7 +547,7 @@ final class PageMotion {
             animation = null;
         }
         outgoing = null;
-        incoming.discardDisplayList();
         target = null;
+        expectedOverlay = null;
     }
 }
