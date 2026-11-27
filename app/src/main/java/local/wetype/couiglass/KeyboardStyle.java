@@ -1,6 +1,7 @@
 package local.wetype.couiglass;
 
 import android.content.res.Configuration;
+import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.ColorFilter;
 import android.graphics.Matrix;
@@ -20,6 +21,7 @@ import android.view.ViewTreeObserver;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.TextView;
 
@@ -29,6 +31,8 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.function.Consumer;
+
+import io.github.libxposed.api.XposedInterface;
 
 final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeObserver.OnGlobalLayoutListener,
         ViewTreeObserver.OnPreDrawListener {
@@ -60,9 +64,12 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
     private static final int CLIPBOARD_ENTRY = 0x7f090144;
     private static final int CLIPBOARD_FOLD_BACK = 0x7f090145;
     private static final int CLIPBOARD_FOLD_FRONT = 0x7f090146;
+    private static final int CLIPBOARD_KEYWORDS = 0x7f090148;
     private static final int CLIPBOARD_TEXT = 0x7f09013b;
+    private static final int CLIPBOARD_ACTION_SCROLL = 0x7f09014a;
     private static final int PHRASE_ENTRY = 0x7f09019e;
     private static final int PHRASE_TEXT = 0x7f090192;
+    private static final int PHRASE_ACTION_SCROLL = 0x7f0901a0;
     private static final int CANDIDATE_PACK_UP = 0x7f0903bf;
     private static final int CANDIDATE_PACK_UP_WRAPPER = 0x7f0903c0;
     private static final int MAIN_CANDIDATE_BAR = 0x7f0900e7;
@@ -86,6 +93,7 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
     private final ClipboardPreviewControls clipboardPreview = new ClipboardPreviewControls(this);
     private final KeyboardLayers layers = new KeyboardLayers(this);
     private final PageMotion pages = new PageMotion(this);
+    private final ListEdgeFade clipboardEdges = new ListEdgeFade();
     private final Map<View, AppliedBackground> changed = new WeakHashMap<>();
     private final Consumer<Boolean> blurListener = this::systemBlurChanged;
     private boolean layoutDirty;
@@ -258,14 +266,26 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
         View container = overlayPanel.findViewById(listId);
         if (container == null || !container.isShown()
                 || !(container.findViewById(SCROLL_CONTAINER_LIST) instanceof ViewGroup list)) return;
+        boolean clipboard = listId == CLIPBOARD_LIST;
+        int actionsId = clipboard ? CLIPBOARD_ACTION_SCROLL : PHRASE_ACTION_SCROLL;
         // RecyclerView can bind and attach new rows during scroll without a global layout pass.
         for (int index = 0; index < list.getChildCount(); index++) {
             View row = list.getChildAt(index);
             View card = row.findViewById(cardId);
-            if (card != null && !(card.getBackground() instanceof GroupCard)) {
-                styleClipboardEntry(card, card.getBackground(), textId);
+            if (card != null) styleClipboardEntry(card, card.getBackground(), textId);
+            if (row.findViewById(actionsId) instanceof HorizontalScrollView actions) {
+                int towardsStart = actions.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL ? 1 : -1;
+                if (actions.canScrollHorizontally(towardsStart)) setHorizontalScrollFade(actions, 16);
+                else if (actions.isHorizontalFadingEdgeEnabled()) {
+                    actions.setHorizontalFadingEdgeEnabled(false);
+                    actions.invalidate();
+                }
             }
-            if (listId == CLIPBOARD_LIST) styleClipboardStack(row, card);
+            if (clipboard) {
+                styleClipboardStack(row, card);
+                View keywords = row.findViewById(CLIPBOARD_KEYWORDS);
+                if (keywords != null && keywords.getVisibility() == View.VISIBLE) setHorizontalScrollFade(keywords, 12);
+            }
         }
     }
 
@@ -281,7 +301,7 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
 
     private void styleClipboardFold(View fold, View entry, View frontFold, int opacity) {
         Drawable background = fold.getBackground();
-        GroupCard surface = background instanceof GroupCard card ? card : new GroupCard(this, fold);
+        GroupCard surface = background instanceof GroupCard card ? card : new GroupCard(this, fold, true);
         if (surface != background) replace(fold, background, surface, false);
         surface.setStackOpacity(opacity);
         surface.maskFold(fold, entry, frontFold);
@@ -289,14 +309,49 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
 
     private void styleClipboardEntry(View view, Drawable original, int textId) {
         if (!(original instanceof GroupCard)) {
-            replace(view, original, new GroupCard(this, view), false);
+            replace(view, original, new GroupCard(this, view, true), false);
         }
         if (view.findViewById(textId) instanceof TextView label) {
+            if (label.getParent() instanceof HorizontalScrollView textScroll) setHorizontalScrollFade(textScroll, 14);
             int inset = Math.max(label.getPaddingStart(), Math.round(CouiGlass.itemInset(view)));
             if (label.getPaddingStart() != inset) {
                 label.setPaddingRelative(inset, label.getPaddingTop(), label.getPaddingEnd(), label.getPaddingBottom());
             }
         }
+    }
+
+    Object drawClipboardList(XposedInterface.Chain chain, ViewGroup list, Canvas canvas) throws Throwable {
+        if (!overlayVisible(CLIPBOARD_PANEL) || list.getWidth() <= 0 || list.getHeight() <= 0) return chain.proceed();
+        View parent = list.getParent() instanceof View view ? view : null;
+        while (parent != null && parent != overlayPanel && parent.getId() != CLIPBOARD_LIST
+                && parent.getId() != PHRASE_LIST) {
+            parent = parent.getParent() instanceof View view ? view : null;
+        }
+        if (parent == null || parent == overlayPanel) return chain.proceed();
+        clipboardEdges.setViewport(list);
+        int length = Math.round(20 * list.getResources().getDisplayMetrics().density);
+        for (int index = 0; index < list.getChildCount(); index++) {
+            View row = list.getChildAt(index);
+            if (row.getVisibility() == View.VISIBLE) clipboardEdges.include(row.getY(), row.getY() + row.getHeight(), length);
+        }
+        if (!clipboardEdges.active()) return chain.proceed();
+        int width = list.getWidth();
+        int saved = clipboardEdges.save(canvas, width);
+        try {
+            Object result = chain.proceed();
+            clipboardEdges.draw(canvas, width);
+            return result;
+        } finally {
+            canvas.restoreToCount(saved);
+        }
+    }
+
+    static void setHorizontalScrollFade(View view, int dp) {
+        int length = Math.round(dp * view.getResources().getDisplayMetrics().density);
+        if (view.getHorizontalFadingEdgeLength() == length) return;
+        view.setHorizontalFadingEdgeEnabled(true);
+        view.setFadingEdgeLength(length);
+        view.invalidate();
     }
 
     private View candidateActionIn(View wrapper) {
@@ -493,8 +548,14 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
         restoreCoveredViews();
     }
 
+    boolean canKeepEditorBackdrop() {
+        return systemBlur && root != null && root.isHardwareAccelerated() && !isFloating(root, 0);
+    }
+
     private void systemBlurChanged(boolean enabled) {
+        if (systemBlur == enabled) return;
         systemBlur = enabled;
+        if (root != null) root.requestLayout();
         refresh();
     }
 
@@ -686,7 +747,7 @@ final class KeyboardStyle implements View.OnAttachStateChangeListener, ViewTreeO
                 styleClipboardEntry(view, original, id == CLIPBOARD_ENTRY ? CLIPBOARD_TEXT : PHRASE_TEXT);
             } else if (id == CHOOSER_CARD && inChooser(view)) {
                 if (!(original instanceof GroupCard)) {
-                    replace(view, original, new GroupCard(this, view), false);
+                    replace(view, original, new GroupCard(this, view, false), false);
                 }
             } else if (isButton(view, zone, boundary) && !KeyboardBackdrop.isBlurDrawable(original)) {
                 replaceButton(view, original);

@@ -6,7 +6,8 @@ final class CouiPalette {
     static int panel(boolean dark, boolean blurred) {
         // The elevated neutral in Apple Dark Mode keeps its hue over a black backdrop.
         if (dark) return blurred ? 0xA81C1C1E : 0xFF1C1C1E;
-        return blurred ? 0xA8BDC2CB : 0xFFD4D7DD;
+        // Match the iOS 27 light keyboard on white with a 74% tint over the live blur.
+        return blurred ? 0xBDD9DCE1 : 0xFFE3E5E9;
     }
 
     static int topBarFill(boolean dark, int opacity) {

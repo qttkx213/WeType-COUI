@@ -4,9 +4,11 @@ import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
 import android.animation.ValueAnimator;
 import android.graphics.Bitmap;
+import android.graphics.BlendMode;
 import android.graphics.Canvas;
 import android.graphics.HardwareRenderer;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.RecordingCanvas;
 import android.graphics.RenderNode;
 import android.os.Bundle;
@@ -35,6 +37,8 @@ final class PageMotion {
     private static final int TOOLBAR_LIST = 0x7f0901c2;
     private static final int TOOLBAR_BACK = 0x7f0904e7;
     private static final int GRID_HANDWRITE = 0x7f090480;
+    private static final float HALF_CROSSFADE = .20f;
+    private static final float PAGE_SCALE_DELTA = .04f;
 
     enum Page {
         KEYBOARD, TOOLS, CLIPBOARD, CLIPBOARD_CLEAN_RECORD, CORRECTION, HANDWRITE_TOOL, TOOL, OTHER;
@@ -64,11 +68,21 @@ final class PageMotion {
     enum Direction {
         NONE, OPEN, CLOSE;
 
-        float verticalOffset(float travel, float fraction) {
+        private float handoff() { return this == CLOSE ? .65f : .35f; }
+
+        float fadeStart() { return handoff() - HALF_CROSSFADE; }
+        float fadeEnd() { return handoff() + HALF_CROSSFADE; }
+
+        int incomingAlpha(float progress) {
+            float fraction = Math.max(0f, Math.min(1f, (progress - fadeStart()) / (fadeEnd() - fadeStart())));
+            return Math.round(255f * fraction * fraction * (3f - 2f * fraction));
+        }
+
+        float pageScale(float fraction) {
             return switch (this) {
-                case OPEN -> -travel * (1f - fraction);
-                case CLOSE -> -travel * fraction;
-                case NONE -> 0f;
+                case OPEN -> 1f - PAGE_SCALE_DELTA * (1f - fraction);
+                case CLOSE -> 1f - PAGE_SCALE_DELTA * fraction;
+                case NONE -> 1f;
             };
         }
     }
@@ -112,6 +126,8 @@ final class PageMotion {
 
     private final KeyboardStyle style;
     private final Paint sourcePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private final Paint incomingPaint = new Paint();
+    private final Rect targetBounds = new Rect();
     private final RenderNode captureNode = new RenderNode("WeType outgoing keyboard page");
     private final ToolNavigation navigation = new ToolNavigation();
     // ColorOS 17 push and pop translation curves from suqi8/coui's COUIPageTransition.
@@ -134,6 +150,7 @@ final class PageMotion {
 
     PageMotion(KeyboardStyle style) {
         this.style = style;
+        incomingPaint.setBlendMode(BlendMode.PLUS);
     }
 
     static void install(WeTypeModule module, ClassLoader loader) throws ReflectiveOperationException {
@@ -446,8 +463,9 @@ final class PageMotion {
     }
 
     private boolean targetMounted() {
-        return (target == null || target.isLaidOut() && target.getWidth() > 0 && target.getHeight() > 0
-                && style.visible(target)) && (expectedOverlay == null || style.overlayVisible(expectedOverlay));
+        return target != null && target.isLaidOut() && !target.isLayoutRequested() && style.visible(target)
+                && target.getGlobalVisibleRect(targetBounds)
+                && (expectedOverlay == null || style.overlayVisible(expectedOverlay));
     }
 
     private void animate(View root) {
@@ -487,7 +505,7 @@ final class PageMotion {
             if (targetMounted()) {
                 animate(root);
             } else if (!timedOut) {
-                canvas.drawBitmap(outgoing, 0f, root.getHeight() - outgoing.getHeight(), null);
+                drawOutgoing(canvas, root.getWidth(), root.getHeight(), 1f, 255);
                 root.postInvalidateOnAnimation();
                 return null;
             } else {
@@ -503,32 +521,53 @@ final class PageMotion {
         int width = root.getWidth();
         int height = root.getHeight();
         boolean returning = direction == Direction.CLOSE;
-        // Fade the pages in sequence so translucent key faces do not overlap.
-        float handoff = returning ? .65f : .35f;
-        float travel = Math.min(24f * root.getResources().getDisplayMetrics().density, height * .12f);
-        if (progress < handoff) {
-            float fraction = progress / handoff;
-            float offset = returning ? direction.verticalOffset(travel, closeExit.getInterpolation(fraction)) : 0f;
-            sourcePaint.setAlpha(Math.round((1f - fraction * fraction) * 255f));
-            int clip = canvas.save();
-            canvas.clipRect(0, 0, width, height);
-            canvas.drawBitmap(outgoing, 0f, height - outgoing.getHeight() + Math.round(offset), sourcePaint);
-            canvas.restoreToCount(clip);
-            return null;
-        }
-        float fraction = (progress - handoff) / (1f - handoff);
-        int alpha = Math.round(fraction * (2f - fraction) * 255f);
-        if (alpha <= 0) return null;
-        int layer = canvas.saveLayerAlpha(0f, 0f, width, height, alpha);
+        int alpha = direction.incomingAlpha(progress);
+        // Mix the weighted contents in a transparent layer, then composite over the live blur once.
+        int saved = canvas.save();
         try {
             canvas.clipRect(0, 0, width, height);
+            boolean crossfading = alpha > 0 && alpha < 255;
+            if (crossfading) canvas.saveLayer(0, 0, width, height, null);
+            if (alpha < 255) {
+                float scale = returning ? direction.pageScale(
+                        closeExit.getInterpolation(progress / direction.fadeEnd())) : 1f;
+                drawOutgoing(canvas, width, height, scale, 255 - alpha);
+            }
+            if (alpha == 0) return null;
+            if (crossfading) {
+                incomingPaint.setAlpha(alpha);
+                canvas.saveLayer(0, 0, width, height, incomingPaint);
+            }
             if (!returning) {
-                float offset = direction.verticalOffset(travel, openEnter.getInterpolation(fraction));
-                canvas.translate(0f, Math.round(offset));
+                float start = direction.fadeStart();
+                float scale = direction.pageScale(openEnter.getInterpolation((progress - start) / (1f - start)));
+                scalePage(canvas, width, scale);
             }
             return style.layers().draw(chain, root, canvas);
         } finally {
-            canvas.restoreToCount(layer);
+            canvas.restoreToCount(saved);
+        }
+    }
+
+    private static void scalePage(Canvas canvas, int width, float scale) {
+        // Anchor at the top so the content moves downward as it grows, inside the rounded panel.
+        canvas.scale(scale, scale, width * .5f, 0f);
+    }
+
+    static float snapshotFit(int frameHeight, int height) {
+        return Math.min(1f, height / (float) frameHeight);
+    }
+
+    private void drawOutgoing(Canvas canvas, int width, int height, float scale, int alpha) {
+        int frameHeight = outgoing.getHeight();
+        int saved = canvas.save();
+        try {
+            // Fit the whole frame if the host shortens the keyboard while mounting the next page.
+            scalePage(canvas, width, scale * snapshotFit(frameHeight, height));
+            sourcePaint.setAlpha(alpha);
+            canvas.drawBitmap(outgoing, 0f, Math.max(0, height - frameHeight), sourcePaint);
+        } finally {
+            canvas.restoreToCount(saved);
         }
     }
 

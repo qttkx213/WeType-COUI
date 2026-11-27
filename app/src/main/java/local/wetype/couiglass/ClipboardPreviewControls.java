@@ -33,6 +33,8 @@ final class ClipboardPreviewControls {
     private final Drawable clearIcon = new ColorDrawable(Color.TRANSPARENT);
     private HorizontalScrollView track;
     private Rect originalClip;
+    private boolean originalFade;
+    private int originalFadeLength;
     private LinearLayout.LayoutParams overlapLayout;
     private int originalRightMargin;
     private IconMargin iconMargin;
@@ -69,7 +71,12 @@ final class ClipboardPreviewControls {
         if (track != nextTrack) {
             releaseTrack();
             track = nextTrack;
-            if (track != null) originalClip = track.getClipBounds();
+            if (track != null) {
+                originalClip = track.getClipBounds();
+                originalFade = track.isHorizontalFadingEdgeEnabled();
+                originalFadeLength = track.getHorizontalFadingEdgeLength();
+                KeyboardStyle.setHorizontalScrollFade(track, 12);
+            }
         }
         ImageView nextArrow = track == null ? null : findArrow(track);
         boolean changed = track != null && syncTrack(row, icon, nextArrow != null);
@@ -378,6 +385,8 @@ final class ClipboardPreviewControls {
         syncInnerIcon(null);
         restoreMargin();
         track.setClipBounds(originalClip);
+        if (originalFadeLength > 0) track.setFadingEdgeLength(originalFadeLength);
+        track.setHorizontalFadingEdgeEnabled(originalFade);
         track = null;
         originalClip = null;
         viewport.setEmpty();

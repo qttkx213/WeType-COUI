@@ -11,7 +11,9 @@ import static local.wetype.couiglass.PageMotion.Source.OTHER;
 import static local.wetype.couiglass.PageMotion.Source.TOOLBAR;
 import static local.wetype.couiglass.PageMotion.inlineMotion;
 import static local.wetype.couiglass.PageMotion.inlinePanel;
+import static local.wetype.couiglass.PageMotion.snapshotFit;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.assertNull;
 
 public class PageMotionTest {
@@ -111,13 +113,32 @@ public class PageMotionTest {
         route(NONE, 501, "CustomPhraseAndClipboard", 1, "ChineseQwerty", OTHER);
     }
 
-    @Test public void toolSlidesDownIntoPlaceAndBackUpOutOfIt() {
-        assertEquals(-24f, OPEN.verticalOffset(24f, 0f), 0f);
-        assertEquals(-12f, OPEN.verticalOffset(24f, .5f), 0f);
-        assertEquals(0f, OPEN.verticalOffset(24f, 1f), 0f);
-        assertEquals(0f, CLOSE.verticalOffset(24f, 0f), 0f);
-        assertEquals(-12f, CLOSE.verticalOffset(24f, .5f), 0f);
-        assertEquals(-24f, CLOSE.verticalOffset(24f, 1f), 0f);
+    @Test public void toolGrowsDownFromTheTopAndContractsBackToIt() {
+        assertEquals(.96f, OPEN.pageScale(0f), 0f);
+        assertEquals(.98f, OPEN.pageScale(.5f), 0f);
+        assertEquals(1f, OPEN.pageScale(1f), 0f);
+        assertEquals(1f, CLOSE.pageScale(0f), 0f);
+        assertEquals(.98f, CLOSE.pageScale(.5f), 0f);
+        assertEquals(.96f, CLOSE.pageScale(1f), 0f);
+    }
+
+    @Test public void resizeFitsTheWholeOutgoingFrameWithoutStretchingShorterFrames() {
+        assertEquals(800f, 920f * snapshotFit(920, 800), .001f);
+        assertEquals(1f, snapshotFit(920, 920), 0f);
+        assertEquals(1f, snapshotFit(800, 920), 0f);
+    }
+
+    @Test public void pagesOverlapAtTheHandoffInBothDirections() {
+        for (PageMotion.Direction direction : new PageMotion.Direction[]{OPEN, CLOSE}) {
+            float start = direction.fadeStart();
+            float end = direction.fadeEnd();
+            assertEquals(0, direction.incomingAlpha(0f));
+            assertEquals(0, direction.incomingAlpha(start));
+            int incoming = direction.incomingAlpha((start + end) / 2f);
+            assertTrue(incoming >= 127 && incoming <= 128);
+            assertEquals(255, direction.incomingAlpha(end));
+            assertEquals(255, direction.incomingAlpha(1f));
+        }
     }
 
     private void route(PageMotion.Direction expected, int fromId, String from, int toId, String to,

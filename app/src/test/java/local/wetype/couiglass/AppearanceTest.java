@@ -7,7 +7,8 @@ import static org.junit.Assert.assertTrue;
 
 public final class AppearanceTest {
     @Test public void usesNeutralPanelColorsWhenBlurIsUnavailable() {
-        assertEquals(0xFFD4D7DD, CouiPalette.panel(false, false));
+        assertEquals(0xFFE3E5E9, CouiPalette.panel(false, false));
+        assertEquals(0xBDD9DCE1, CouiPalette.panel(false, true));
         assertEquals(0xFF1C1C1E, CouiPalette.panel(true, false));
         assertEquals(0xA81C1C1E, CouiPalette.panel(true, true));
         for (boolean dark : new boolean[]{true, false}) {

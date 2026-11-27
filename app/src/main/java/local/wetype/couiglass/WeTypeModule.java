@@ -5,6 +5,7 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.inputmethodservice.InputMethodService;
+import android.text.InputType;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
@@ -29,7 +30,7 @@ public final class WeTypeModule extends XposedModule {
     private Method darkSkin;
     private InputMethodService service;
     private KeyboardStyle style;
-    private boolean overlayDemoSearch;
+    private boolean overlayEditorBackdrop;
 
     @Override public void onModuleLoaded(ModuleLoadedParam param) {
         processName = param.getProcessName();
@@ -76,7 +77,7 @@ public final class WeTypeModule extends XposedModule {
             intercept(startInput, chain -> {
                 Object result = chain.proceed();
                 if (owns(chain)) {
-                    updateDemoSearch((EditorInfo) chain.getArg(0));
+                    updateEditorBackdrop((EditorInfo) chain.getArg(0));
                     style.refresh();
                 }
                 return result;
@@ -107,7 +108,7 @@ public final class WeTypeModule extends XposedModule {
                     style.unbind();
                     style = null;
                     service = null;
-                    overlayDemoSearch = false;
+                    overlayEditorBackdrop = false;
                 }
                 return chain.proceed();
             });
@@ -155,14 +156,18 @@ public final class WeTypeModule extends XposedModule {
                     warn("Expanded candidate backdrop unavailable", failure);
                 }
                 try {
-                    Method computeInsets = ime.getClass().getDeclaredMethod("onComputeInsets", InputMethodService.Insets.class);
-                    intercept(computeInsets, chain -> {
+                    // Apply the overlay after the navigation bar has adjusted the content inset.
+                    Class<?> bars = Class.forName("android.inputmethodservice.NavigationBarController");
+                    Method updateInsets = bars.getDeclaredMethod("updateInsets", InputMethodService.Insets.class);
+                    intercept(updateInsets, chain -> {
                         Object result = chain.proceed();
-                        if (owns(chain) && overlayDemoSearch) keepDemoBackdrop((InputMethodService.Insets) chain.getArg(0));
+                        if (style != null && overlayEditorBackdrop) {
+                            keepEditorBackdrop((InputMethodService.Insets) chain.getArg(0));
+                        }
                         return result;
                     });
                 } catch (ReflectiveOperationException | RuntimeException | LinkageError failure) {
-                    warn("Demo search backdrop compatibility unavailable", failure);
+                    warn("Editor backdrop compatibility unavailable", failure);
                 }
                 compatible = true;
                 trace("WeType " + version + ", API=" + getApiVersion());
@@ -178,8 +183,12 @@ public final class WeTypeModule extends XposedModule {
         }
     }
 
-    private void updateDemoSearch(EditorInfo editor) {
-        boolean overlay = false;
+    private void updateEditorBackdrop(EditorInfo editor) {
+        boolean overlay = editor != null && ("com.oplus.aipaper".equals(editor.packageName)
+                || "com.coloros.note".equals(editor.packageName))
+                && (editor.inputType & (InputType.TYPE_MASK_CLASS | InputType.TYPE_MASK_VARIATION))
+                        == (InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_WEB_EDIT_TEXT)
+                && (editor.imeOptions & EditorInfo.IME_MASK_ACTION) == EditorInfo.IME_ACTION_NONE;
         if (editor != null && "com.itos.coui.demo".equals(editor.packageName)
                 && (editor.imeOptions & EditorInfo.IME_MASK_ACTION) == EditorInfo.IME_ACTION_SEARCH) {
             try {
@@ -192,19 +201,19 @@ public final class WeTypeModule extends XposedModule {
                 // Leave layout insets alone when the installed Demo version is unknown.
             }
         }
-        if (overlayDemoSearch == overlay) return;
-        overlayDemoSearch = overlay;
+        if (overlayEditorBackdrop == overlay) return;
+        overlayEditorBackdrop = overlay;
         View decor = imeDecor();
         if (decor != null) decor.requestLayout();
     }
 
-    private void keepDemoBackdrop(InputMethodService.Insets insets) {
-        if (!service.isInputViewShown() || service.isFullscreenMode()
+    private void keepEditorBackdrop(InputMethodService.Insets insets) {
+        if (!style.canKeepEditorBackdrop() || !service.isInputViewShown() || service.isFullscreenMode()
                 || insets.touchableInsets != InputMethodService.Insets.TOUCHABLE_INSETS_VISIBLE) return;
         View decor = imeDecor();
         if (decor == null || decor.getHeight() <= insets.contentTopInsets) return;
-        // These Demo versions apply IME padding to the entire Scaffold, cutting away the blur source.
-        // Report overlay content while preserving the visible and touchable keyboard bounds.
+        // A nonzero IME inset makes the system slide an opaque keyboard only that far.
+        // With no content inset, Android uses the overlay transition with a fade and slide.
         insets.contentTopInsets = decor.getHeight();
     }
 

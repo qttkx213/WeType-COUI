@@ -14,8 +14,8 @@ android {
         applicationId = "local.wetype.couiglass"
         minSdk = 31
         targetSdk = 37
-        versionCode = 31
-        versionName = "0.4.6"
+        versionCode = 32
+        versionName = "0.4.7"
     }
 
     buildTypes {

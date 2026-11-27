@@ -62,7 +62,8 @@ internal class ExpandedCandidates(private val style: KeyboardStyle) {
             // Fake entries hide the label without clearing a recycled TextView's previous text.
             if (label != null && label.visibility == View.VISIBLE && !label.text.isNullOrBlank()) {
                 emptyWords.remove(cell)?.restore(cell)
-                surface(cell) { original -> InsetDrawable(ButtonBackground(style, cell, original), gap) }
+                // The list clips the face and label together, including during press motion.
+                surface(cell) { original -> InsetDrawable(ButtonBackground(style, cell, original, false), gap) }
             } else {
                 clearBackground(cell)
                 if (native.isPlaceholder(list, cell)) disableWordClicks(cell)
@@ -233,7 +234,7 @@ internal class ExpandedCandidates(private val style: KeyboardStyle) {
         private const val PINYIN = 0x7f09049c
         private const val WORD_GRID = 0x7f09049d
         private const val LIST = 0x7f0904af
-        private const val DELETE = 0x7f0900d9
+        internal const val DELETE = 0x7f0900d9
         private const val VERTICAL_DIVIDER = 0x7f090627
         private const val WORD_ITEM = 0x7f090072
         private const val WORD_LABEL = 0x7f09049e

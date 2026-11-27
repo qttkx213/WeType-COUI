@@ -13,6 +13,7 @@ import android.view.View;
 final class GroupCard extends Drawable {
     private final KeyboardStyle style;
     private final float density;
+    private final boolean lightKeyMaterial;
     private int alpha = 255;
     private int stackOpacity = 255;
     private float radius;
@@ -20,8 +21,9 @@ final class GroupCard extends Drawable {
     private RectF entryBounds;
     private RectF frontFoldBounds;
 
-    GroupCard(KeyboardStyle style, View owner) {
+    GroupCard(KeyboardStyle style, View owner, boolean lightKeyMaterial) {
         this.style = style;
+        this.lightKeyMaterial = lightKeyMaterial;
         density = owner.getResources().getDisplayMetrics().density;
     }
 
@@ -81,6 +83,7 @@ final class GroupCard extends Drawable {
         boolean dark = style.dark();
         Rect bounds = getBounds();
         int opacity = (alpha * stackOpacity + 127) / 255;
+        int fill = lightKeyMaterial && !dark ? CouiPalette.topBarFill(false, opacity) : CouiGlass.segment(dark, opacity);
         int save = 0;
         // Let each exposed layer tint the shared blurred backdrop once.
         if (foldCover != null && !foldCover.isEmpty()) {
@@ -89,7 +92,7 @@ final class GroupCard extends Drawable {
         }
         try {
             style.material().draw(canvas, bounds.left, bounds.top, bounds.right, bounds.bottom, density,
-                    radius, CouiGlass.segment(dark, opacity), opacity, false, dark, null);
+                    radius, fill, opacity, false, dark, null);
         } finally {
             if (save != 0) canvas.restoreToCount(save);
         }
